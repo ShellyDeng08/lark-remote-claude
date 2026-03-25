@@ -139,19 +139,23 @@ class MentionInfo:
   - `get(key, default)` - 获取配置项
   - `set(key, value)` - 设置配置项
   - `validate()` - 验证配置合法性
+    - `check_interval_minutes`: 必须在 5-60 范围内
+    - `chat_id` 格式: 必须以 `oc_` 或 `ou_` 开头
+    - `auto_check_enabled`: 必须是 bool 类型
+    - 验证失败抛出 `ValueError` 或 `TypeError`
 
 #### 2.2.3 lark_handler.py（修改）
 
 **新增命令**:
 
-| 命令 | 功能 | 返回 |
-|------|------|------|
-| `/check-mentions` | 立即检查未回复@消息 | @消息列表卡片 |
-| `/mentions-auto on\|off [interval]` | 开启/关闭自动检查 | 状态确认卡片 |
-| `/mentions-config` | 配置黑名单/重点群 | 配置管理卡片 |
-| `/mentions-status` | 查看@消息检查状态 | 状态信息卡片 |
-| `/commands` | 命令总览 | 所有命令列表卡片 |
-| `/config` | 统一配置入口 | 配置管理卡片 |
+| 命令 | 参数 | 功能 | 返回 |
+|------|------|------|------|
+| `/check-mentions` | `[--all]` | 立即检查未回复@消息。`--all` 表示全量检查（不限50个群） | @消息列表卡片 |
+| `/mentions-auto` | `on\|off [interval]` | 开启/关闭自动检查。`interval` 为检查间隔（分钟，5-60，默认10） | 状态确认卡片 |
+| `/mentions-config` | `blacklist\|priority add\|remove\|list [chat_id]` | 配置黑名单/重点群。示例：`/mentions-config blacklist add oc_xxx` | 配置管理卡片 |
+| `/mentions-status` | 无 | 查看@消息检查状态（自动检查开关、间隔、上次检查时间、未回复数量） | 状态信息卡片 |
+| `/commands` | 无 | 显示所有可用命令及说明 | 所有命令列表卡片 |
+| `/config` | `[key] [value]` | 统一配置管理。无参数显示所有配置；带参数修改配置 | 配置管理卡片 |
 
 **整合命令**:
 
@@ -205,8 +209,20 @@ class MentionInfo:
       → 检查话题回复中的 @mentions
 
       [判断是否回复]
-      → 检查 @消息时间之后是否有自己的回复
-      → 记录未回复消息
+      对于主消息流中的@：
+        → 检查该群的主消息流中，@消息时间之后是否有自己发送的消息
+        → 如果有，标记为已回复
+
+      对于话题回复中的@：
+        → 检查该话题内，@消息时间之后是否有自己发送的消息
+        → 如果有，标记为已回复
+
+      注意：
+        - 主消息中的@，只在主消息流检查回复
+        - 话题中的@，只在该话题内检查回复
+        - 不跨话题、不跨群检查回复
+
+      → 记录所有未回复消息
 
   → MentionState.get_new_mentions(current_unreplied)
   → [有新增] CardBuilder.build_mentions_card()
@@ -282,19 +298,29 @@ except UserApiError as e:
 
 **策略**:
 1. **分批检查**: 每次最多检查 50 个群
-2. **轮换策略**: 记录上次检查到的位置，下次从该位置继续
+2. **轮换策略详细说明**:
+   - 维护两个检查队列：优先群队列 + 普通群队列
+   - 优先群每次都检查（不占用50个群配额）
+   - 普通群使用循环队列：记录 `last_checked_index`，下次从 `last_checked_index + 1` 开始
+   - 到达队列末尾后，重置 `last_checked_index = 0`，从头开始新一轮
+   - 示例：假设有 200 个普通群，第一次检查 0-49，第二次检查 50-99，...，第五次检查到 199 后重置
 3. **优先级**: 重点群每次都检查，其他群轮换
-4. **手动全量**: 用户可以发送 `/check-mentions --all` 强制全量检查
+4. **手动全量**: 用户可以发送 `/check-mentions --all` 强制全量检查（一次性检查所有群，可能耗时较长）
 
 **实现**:
 ```python
 # mention_state.json
 {
-  "last_batch_page_token": "xxx",
-  "priority_last_check": 1234567890,
-  "rotation_last_check": 1234567800
+  "last_checked_index": 49,              # 上次检查到的普通群索引（下次从50开始）
+  "priority_last_check": 1234567890,     # 重点群上次检查时间戳
+  "rotation_last_check": 1234567800,     # 普通群轮换上次检查时间戳
+  "total_chats_count": 200              # 总群数（用于判断是否需要重置索引）
 }
 ```
+
+**配额分配**:
+- 如果重点群 <= 50 个：重点群全检查（不占配额），普通群检查 50 个
+- 如果重点群 > 50 个：只检查重点群，普通群本次跳过
 
 ### 4.4 网络异常
 
@@ -390,22 +416,67 @@ except UserApiError as e:
 ```python
 class TestMentionPoller:
     def test_check_main_messages():
-        """测试主消息流@检测"""
+        """
+        测试主消息流@检测
+        预期：给定包含@消息的消息列表，正确识别出@当前用户的消息
+        """
 
     def test_check_thread_messages():
-        """测试话题回复@检测（使用 thread_id）"""
+        """
+        测试话题回复@检测（使用 thread_id）
+        预期：
+        - 使用根消息的 thread_id 查询话题
+        - 正确识别话题中的@消息
+        - 不会对没有 thread_id 的消息报错
+        """
 
     def test_detect_new_mentions():
-        """测试新增@检测逻辑"""
+        """
+        测试新增@检测逻辑
+        预期：
+        - 给定旧状态和新状态，正确识别出新增的未回复@
+        - 已回复的@消息不在结果中
+        - 状态中已存在的未回复@不算新增
+        """
 
     def test_blacklist_filter():
-        """测试黑名单过滤"""
+        """
+        测试黑名单过滤
+        预期：黑名单中的群不会被检查
+        """
 
     def test_priority_chats():
-        """测试重点群优先检查"""
+        """
+        测试重点群优先检查
+        预期：
+        - 重点群每次都检查
+        - 重点群不占用50个普通群配额
+        """
 
     def test_batch_rotation():
-        """测试大量群的轮换检查"""
+        """
+        测试大量群的轮换检查
+        预期：
+        - 200个群分4批检查（每批50）
+        - 第一次检查 0-49，第二次 50-99，...
+        - 第5次检查时重置索引为 0
+        """
+
+    def test_reply_detection_main_message():
+        """
+        测试主消息流回复判断
+        预期：
+        - @消息时间后，用户在该群发送了消息 → 已回复
+        - @消息时间后，用户未发消息 → 未回复
+        """
+
+    def test_reply_detection_thread():
+        """
+        测试话题回复判断
+        预期：
+        - @消息在话题中，用户在该话题后续回复 → 已回复
+        - @消息在话题中，用户在主消息流回复（不在话题） → 未回复
+        """
 ```
 
 **tests/lark_client/test_config_service.py**
@@ -413,13 +484,28 @@ class TestMentionPoller:
 ```python
 class TestConfigService:
     def test_load_config():
-        """测试配置加载（含默认值）"""
+        """
+        测试配置加载（含默认值）
+        预期：
+        - 文件不存在时，返回默认配置
+        - 文件存在时，加载文件配置
+        - 缺失字段自动填充默认值
+        """
 
     def test_save_config():
-        """测试配置保存"""
+        """
+        测试配置保存
+        预期：配置正确保存到 ~/.remote-claude/config.json
+        """
 
     def test_config_validation():
-        """测试配置验证（间隔范围、chat_id 格式）"""
+        """
+        测试配置验证（间隔范围、chat_id 格式）
+        预期：
+        - check_interval_minutes: 5-60，否则抛出 ValueError
+        - chat_id 格式: oc_xxx 或 ou_xxx，否则抛出 ValueError
+        - auto_check_enabled: bool类型，否则抛出 TypeError
+        """
 ```
 
 ### 6.2 集成测试
@@ -429,17 +515,48 @@ class TestConfigService:
 ```python
 @pytest.mark.integration
 class TestMentionIntegration:
+    """
+    集成测试环境要求：
+    1. 设置环境变量：FEISHU_TEST_TOKEN（有效的 user_access_token）
+    2. 设置环境变量：FEISHU_TEST_USER_ID（测试用户的 open_id）
+    3. 准备测试群：至少一个群，包含@测试用户的消息
+    """
+
     def test_oauth_flow():
-        """测试完整 OAuth 流程"""
+        """
+        测试完整 OAuth 流程
+        预期：
+        - 生成授权链接
+        - 模拟回调后成功获取 token
+        - token 存储到 user_tokens.json
+        """
 
     def test_check_real_chats():
-        """测试真实群消息检查（需要测试 token）"""
+        """
+        测试真实群消息检查（需要测试 token）
+        预期：
+        - 调用真实飞书 API
+        - 返回测试群的@消息
+        - 验证消息格式正确
+        """
 
     def test_auto_check_loop():
-        """测试自动检查循环（短间隔验证）"""
+        """
+        测试自动检查循环（短间隔验证）
+        预期：
+        - 设置 1 分钟间隔
+        - 等待 2 分钟后检查是否执行了 2 次
+        - 停止后不再执行
+        """
 
     def test_notification_send():
-        """测试通知卡片发送"""
+        """
+        测试通知卡片发送
+        预期：
+        - 发送@消息通知卡片到测试用户私聊
+        - 卡片包含群名、时间、发送者、跳转链接
+        - 验证卡片格式符合飞书规范
+        """
 ```
 
 ### 6.3 测试数据
@@ -598,5 +715,4 @@ MOCK_THREAD_MESSAGES = [...]
 
 ---
 
-**批准签名**: _____________
-**批准日期**: _____________
+## 10. 总结
