@@ -1,6 +1,8 @@
 # Lark Remote Claude
 
-在电脑终端运行 Claude Code / Codex，同时通过飞书实时查看输出、发送指令、点击交互按钮（选项/权限确认）。
+在电脑终端运行 Claude Code / Codex，同时通过飞书（Feishu / Lark）实时查看输出、发送指令、点击交互按钮（选项/权限确认）。
+
+Feishu/Lark remote terminal bridge for Claude Code and Codex.
 
 ## 这个项目解决什么问题
 
@@ -173,6 +175,10 @@ OAUTH_SERVER_PORT=8080
 ### 3) 终端与飞书显示不一致
 
 先查看 `docs/LARK_CLIENT_GUIDE.md` 的排障部分。
+
+## 关键词（便于搜索）
+
+Claude Code, Codex, Feishu bot, Lark bot, remote terminal, shared CLI session, AI coding assistant.
 
 ## 文档
 

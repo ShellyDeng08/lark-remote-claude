@@ -1,7 +1,7 @@
 {
   "name": "lark-remote-claude",
   "version": "1.0.0",
-  "description": "双端共享 Claude CLI 工具",
+  "description": "Run Claude Code/Codex from Feishu (Lark) with shared terminal sessions and interactive cards.",
   "bin": {
     "remote-claude": "bin/remote-claude",
     "cla": "bin/cla",
@@ -38,14 +38,22 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ShellyDeng08/remote_claude.git"
+    "url": "git+https://github.com/ShellyDeng08/lark-remote-claude.git"
+  },
+  "homepage": "https://github.com/ShellyDeng08/lark-remote-claude#readme",
+  "bugs": {
+    "url": "https://github.com/ShellyDeng08/lark-remote-claude/issues"
   },
   "keywords": [
-    "claude",
+    "claude-code",
+    "codex",
+    "feishu",
+    "lark",
+    "terminal-sharing",
+    "remote-terminal",
     "cli",
-    "terminal",
-    "pty",
-    "lark"
+    "ai-coding",
+    "pty"
   ],
   "engines": {
     "node": ">=16"
