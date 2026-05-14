@@ -29,8 +29,29 @@ from .card_builder import (
     build_help_card,
     build_dir_card,
     build_menu_card,
+    build_monitor_list_card,
+    build_summary_card,
+    build_monitor_config_card,
+    _build_header,
 )
 from .shared_memory_poller import SharedMemoryPoller, CardSlice
+from .text_message_poller import TextMessagePoller, _build_pending_card
+from .monitor_config import MonitorConfigService
+
+# 消息模式: "card" (卡片模式) 或 "text" (文本模式)
+# 可以通过环境变量 LARK_MESSAGE_MODE 设置
+import os as _os
+MESSAGE_MODE = _os.environ.get("LARK_MESSAGE_MODE", "text").lower()  # 默认使用文本模式
+
+# 飞书机器人菜单中文名称 → 命令映射（菜单类型选"发送文字消息"，名称填左列）
+# 底部菜单：会话列表 | 菜单 | ≡更多（创建群组/帮助/当前状态）
+_MENU_ALIASES = {
+    "会话列表": "/list",
+    "菜单":    "/menu",
+    "创建群组": "/new-group",
+    "帮助":    "/help",
+    "当前状态": "/status",
+}
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from utils.session import list_active_sessions, get_socket_path, get_chat_bindings_file, ensure_user_data_dir, USER_DATA_DIR
@@ -77,16 +98,91 @@ class LarkHandler:
         self._bridges: Dict[str, SessionBridge] = {}
         # chat_id → session_name（当前连接状态）
         self._chat_sessions: Dict[str, str] = {}
-        # 共享内存轮询器
-        self._poller = SharedMemoryPoller(card_service)
+        # 消息轮询器（根据模式选择卡片或文本）
+        if MESSAGE_MODE == "card":
+            self._poller = SharedMemoryPoller(card_service)
+            self._text_poller = None
+            logger.info("使用卡片模式 (MESSAGE_MODE=card)")
+        else:
+            self._poller = None  # 卡片模式轮询器不启用
+            self._text_poller = TextMessagePoller(card_service)
+            logger.info("使用文本模式 (MESSAGE_MODE=text)")
         # chat_id → session_name 持久化绑定（重启后自动恢复）
         self._chat_bindings: Dict[str, str] = self._load_chat_bindings()
         # 专属群聊 chat_id 集合（仅包含通过 /new-group 创建的群）
         self._group_chat_ids: set = self._load_group_chat_ids()
-        # chat_id → CardSlice（用户主动断开后保留，供重连时冻结旧卡片）
+        # chat_id → CardSlice（用户主动断开后保留，供重连时冻结旧卡片）- 仅卡片模式使用
         self._detached_slices: Dict[str, CardSlice] = {}
+        # OAuth 服务实例（由 main.py 的 LarkBot._init_oauth 注入，未启用时为 None）
+        self.oauth_service = None
         # 正在启动中的会话名集合（防止并发点击触发竞态）
         self._starting_sessions: set = set()
+        # 监听配置服务
+        self.monitor_config = MonitorConfigService()
+        # User API 实例（由 main.py 注入，用于读取群聊信息）
+        self.user_api = None
+
+    @property
+    def _is_card_mode(self) -> bool:
+        """是否为卡片模式"""
+        return MESSAGE_MODE == "card"
+
+    def _start_poller(self, chat_id: str, session_name: str, is_group: bool = False,
+                      notify_user_id: Optional[str] = None) -> None:
+        """启动轮询器（根据模式选择）"""
+        if self._is_card_mode and self._poller:
+            self._poller.start(chat_id, session_name, is_group=is_group,
+                               notify_user_id=notify_user_id)
+        elif self._text_poller:
+            # 通过 pid 获取 cwd，取最后一级目录名作为卡片标题
+            display_name = "Claude"
+            sessions = list_active_sessions()
+            session = next((s for s in sessions if s["name"] == session_name), None)
+            if session:
+                pid = session.get("pid")
+                if pid:
+                    cwd = self._get_pid_cwd(pid)
+                    if cwd:
+                        display_name = cwd.rstrip("/").rsplit("/", 1)[-1]
+            self._text_poller.start(chat_id, session_name, is_group=is_group,
+                                    display_name=display_name)
+
+    def _stop_poller(self, chat_id: str) -> Optional[CardSlice]:
+        """停止轮询器，返回 CardSlice（仅卡片模式有效）"""
+        if self._is_card_mode and self._poller:
+            return self._poller.stop_and_get_active_slice(chat_id)
+        elif self._text_poller:
+            self._text_poller.stop(chat_id)
+        return None
+
+    def _kick_poller(self, chat_id: str) -> None:
+        """触发立即轮询"""
+        if self._is_card_mode and self._poller:
+            self._kick_poller(chat_id)
+        elif self._text_poller:
+            self._text_poller.kick(chat_id)
+
+    def _read_snapshot(self, chat_id: str) -> Optional[dict]:
+        """读取共享内存快照（兼容两种模式）"""
+        # 优先使用卡片的 poller（它维护了 reader 实例）
+        if self._is_card_mode and self._poller:
+            return self._read_snapshot(chat_id)
+        # 文本模式：直接从共享内存读取
+        session_name = self._chat_sessions.get(chat_id)
+        if not session_name:
+            return None
+        try:
+            import sys as _sys
+            _sys.path.insert(0, str(Path(__file__).parent.parent / "server"))
+            from shared_state import SharedStateReader, get_mq_path
+            mq_path = get_mq_path(session_name)
+            if not mq_path.exists():
+                return None
+            reader = SharedStateReader(session_name)
+            return reader.read()
+        except Exception as e:
+            logger.warning(f"读取共享内存失败: {e}")
+            return None
 
     # ── 持久化绑定 ──────────────────────────────────────────────────────────
 
@@ -139,17 +235,17 @@ class LarkHandler:
     async def _attach(self, chat_id: str, session_name: str,
                       user_id: Optional[str] = None) -> bool:
         """统一 attach 逻辑（私聊/群聊共用）"""
-        # 在断开旧连接之前，先更新旧流式卡片为已断开状态
+        # 在断开旧连接之前，先更新旧流式卡片为已断开状态（仅卡片模式）
         old_session = self._chat_sessions.get(chat_id)
-        old_slice = self._poller.stop_and_get_active_slice(chat_id)
-        if old_slice and old_session:
+        old_slice = self._stop_poller(chat_id)
+        if old_slice and old_session and self._is_card_mode:
             await self._update_card_disconnected(chat_id, old_session, old_slice)
 
         # 断开旧 bridge
         old = self._bridges.pop(chat_id, None)
         if old:
             await old.disconnect()
-        # _poller.stop 已通过 stop_and_get_active_slice 完成
+        # _poller.stop 已通过 _stop_poller 完成
         self._chat_sessions.pop(chat_id, None)
         self._detached_slices.pop(chat_id, None)
 
@@ -160,7 +256,7 @@ class LarkHandler:
         if await bridge.connect():
             self._bridges[chat_id] = bridge
             self._chat_sessions[chat_id] = session_name
-            self._poller.start(chat_id, session_name, is_group=(chat_id in self._group_chat_ids),
+            self._start_poller(chat_id, session_name, is_group=(chat_id in self._group_chat_ids),
                                notify_user_id=user_id)
             _track_stats('lark', 'attach', session_name=session_name,
                          chat_id=chat_id)
@@ -173,20 +269,20 @@ class LarkHandler:
         if bridge:
             await bridge.disconnect()
         self._chat_sessions.pop(chat_id, None)
-        self._poller.stop(chat_id)
+        self._stop_poller(chat_id)
 
     async def _on_disconnect(self, chat_id: str, session_name: str):
         """服务端关闭连接时的统一处理"""
         logger.info(f"会话 '{session_name}' 断线, chat_id={chat_id[:8]}...")
         _track_stats('lark', 'disconnect', session_name=session_name,
                      chat_id=chat_id)
-        active_slice = self._poller.stop_and_get_active_slice(chat_id)
+        active_slice = self._stop_poller(chat_id)
         self._bridges.pop(chat_id, None)
         self._chat_sessions.pop(chat_id, None)
         self._detached_slices.pop(chat_id, None)
         self._remove_binding_by_chat(chat_id)
 
-        if active_slice:
+        if active_slice and self._is_card_mode:
             await self._update_card_disconnected(chat_id, session_name, active_slice)
 
         # 会话退出时自动解散绑定到该会话的所有专属群聊
@@ -200,18 +296,40 @@ class LarkHandler:
         logger.info(f"收到消息: user={user_id[:8]}..., chat={chat_id[:8]}..., type={chat_type}, text={text[:50]}")
         text = text.strip()
 
-        if text.startswith("/"):
-            # /cl 前缀：去掉前缀，转发给 Claude
-            if text == "/cl" or text.startswith("/cl "):
-                claude_text = text[3:].strip()
-                if claude_text:
-                    await self._forward_to_claude(user_id, chat_id, claude_text)
-                    _track_stats('lark', 'message',
-                                 session_name=self._chat_sessions.get(chat_id, ''),
-                                 chat_id=chat_id)
+        try:
+            # 飞书菜单发送的中文名称 → 映射为命令
+            menu_alias = _MENU_ALIASES.get(text)
+            if menu_alias:
+                text = menu_alias
+
+            if text.startswith("/"):
+                # /cl 前缀：去掉前缀，转发给 Claude
+                if text == "/cl" or text.startswith("/cl "):
+                    claude_text = text[3:].strip()
+                    if claude_text:
+                        await self._forward_to_claude(user_id, chat_id, claude_text)
+                        _track_stats('lark', 'message',
+                                     session_name=self._chat_sessions.get(chat_id, ''),
+                                     chat_id=chat_id)
+                else:
+                    await self._handle_command(user_id, chat_id, text)
             else:
-                await self._handle_command(user_id, chat_id, text)
-        # else: 普通聊天消息（无 /cl 前缀），不再转发给 Claude
+                # 普通聊天消息：直接转发给 Claude
+                await self._forward_to_claude(user_id, chat_id, text)
+                _track_stats('lark', 'message',
+                             session_name=self._chat_sessions.get(chat_id, ''),
+                             chat_id=chat_id)
+        except Exception as e:
+            logger.error(f"处理消息失败: {e}", exc_info=True)
+            try:
+                await card_service.send_text(
+                    chat_id,
+                    f"❌ 处理消息时发生错误\n\n"
+                    f"错误信息: {str(e)}\n\n"
+                    f"请稍后重试或联系管理员。"
+                )
+            except Exception as send_error:
+                logger.error(f"发送错误消息失败: {send_error}")
 
     async def forward_to_claude(self, user_id: str, chat_id: str, text: str):
         """卡片输入框直通 Claude（跳过命令路由）"""
@@ -249,8 +367,29 @@ class LarkHandler:
             await self._cmd_help(user_id, chat_id)
         elif command == "/menu":
             await self._cmd_menu(user_id, chat_id)
+        elif command == "/oauth":
+            await self._cmd_oauth(user_id, chat_id)
+        elif command == "/oauth-status":
+            await self._cmd_oauth_status(user_id, chat_id)
+        elif command == "/oauth-revoke":
+            await self._cmd_oauth_revoke(user_id, chat_id)
+        elif command in ("/check-messages", "/check-mentions"):  # 新命令 + 旧命令别名
+            await self._cmd_check_mentions(user_id, chat_id, args)
+        elif command in ("/messages-auto", "/mentions-auto"):  # 新命令 + 旧命令别名
+            await self._cmd_mentions_auto(user_id, chat_id, args)
+        elif command in ("/messages-config", "/mentions-config"):  # 新命令 + 旧命令别名
+            await self._cmd_mentions_config(user_id, chat_id, args)
+        elif command in ("/messages-status", "/mentions-status"):  # 新命令 + 旧命令别名
+            await self._cmd_mentions_status(user_id, chat_id)
+        elif command == "/commands":
+            await self._cmd_commands(user_id, chat_id)
+        elif command == "/config":
+            await self._cmd_config(user_id, chat_id, args)
+        elif command == "/monitor":
+            await self._cmd_monitor(user_id, chat_id, args)
         else:
-            await card_service.send_text(chat_id, f"未知命令: {command}\n使用 /help 查看帮助")
+            # 非 Remote Claude 命令 → 转发给 Claude CLI（如 /clear、/compact 等）
+            await self._forward_to_claude(user_id, chat_id, text)
 
     # ── 命令处理 ─────────────────────────────────────────────────────────────
 
@@ -348,7 +487,7 @@ class LarkHandler:
         script_dir = Path(__file__).parent.parent.absolute()
         server_script = script_dir / "server" / "server.py"
         cmd = ["uv", "run", "--project", str(script_dir), "python3", str(server_script), session_name]
-        if self._poller.get_bypass_enabled():
+        if self._is_card_mode and self._poller and self._poller.get_bypass_enabled():
             cmd += ["--", "--dangerously-skip-permissions", "--permission-mode=dontAsk"]
 
         logger.info(f"启动会话: {session_name}, 工作目录: {work_dir}, 命令: {' '.join(cmd)}")
@@ -426,7 +565,7 @@ class LarkHandler:
         script_dir = Path(__file__).parent.parent.absolute()
         server_script = script_dir / "server" / "server.py"
         cmd = ["uv", "run", "--project", str(script_dir), "python3", str(server_script), session_name]
-        if self._poller.get_bypass_enabled():
+        if self._is_card_mode and self._poller and self._poller.get_bypass_enabled():
             cmd += ["--", "--dangerously-skip-permissions", "--permission-mode=dontAsk"]
 
         try:
@@ -494,8 +633,8 @@ class LarkHandler:
         # 断开所有连接到此会话的 chat
         for cid, sname in list(self._chat_sessions.items()):
             if sname == session_name:
-                active_slice = self._poller.stop_and_get_active_slice(cid)
-                if active_slice:
+                active_slice = self._stop_poller(cid)
+                if active_slice and self._is_card_mode:
                     await self._update_card_disconnected(cid, sname, active_slice)
                 await self._detach(cid)
                 self._remove_binding_by_chat(cid, force=True)
@@ -518,13 +657,13 @@ class LarkHandler:
                                    message_id: Optional[str] = None):
         """会话列表卡片中断开连接，就地刷新列表"""
         session_name = self._chat_sessions.get(chat_id, "")
-        # 更新流式卡片为已断开状态
-        active_slice = self._poller.stop_and_get_active_slice(chat_id)
-        if active_slice and session_name:
+        # 更新流式卡片为已断开状态（仅卡片模式）
+        active_slice = self._stop_poller(chat_id)
+        if active_slice and session_name and self._is_card_mode:
             await self._update_card_disconnected(chat_id, session_name, active_slice)
 
         self._remove_binding_by_chat(chat_id)
-        await self._detach(chat_id)   # bridge.disconnect + _poller.stop（幂等）
+        await self._detach(chat_id)   # bridge.disconnect + _stop_poller（幂等）
         await self._cmd_list(user_id, chat_id, message_id=message_id)
 
     async def _update_card_disconnected(self, chat_id: str, session_name: str,
@@ -557,9 +696,9 @@ class LarkHandler:
 
     async def _handle_stream_detach(self, user_id: str, chat_id: str,
                                      session_name: str, message_id: Optional[str] = None):
-        """流式卡片中断开连接，就地更新卡片为已断开状态"""
+        """流式卡片中断开连接，就地更新卡片为已断开状态（仅卡片模式）"""
         # 停止轮询并获取活跃 CardSlice（原子操作）
-        active_slice = self._poller.stop_and_get_active_slice(chat_id)
+        active_slice = self._stop_poller(chat_id)
 
         # 读取最后快照的 blocks
         blocks = []
@@ -633,23 +772,18 @@ class LarkHandler:
 
     async def _cmd_menu(self, user_id: str, chat_id: str,
                          message_id: Optional[str] = None, page: int = 0):
-        """显示快捷操作菜单（内嵌会话列表）"""
+        """显示会话列表菜单"""
         sessions = list_active_sessions()
         current = self._chat_sessions.get(chat_id)
-        session_groups = {
-            self._chat_bindings[cid]: cid
-            for cid in self._group_chat_ids
-            if cid in self._chat_bindings
-        }
-        card = build_menu_card(sessions, current_session=current, session_groups=session_groups, page=page,
-                               notify_enabled=self._poller.get_notify_enabled(),
-                               urgent_enabled=self._poller.get_urgent_enabled(),
-                               bypass_enabled=self._poller.get_bypass_enabled())
+        card = build_menu_card(sessions, current_session=current, page=page)
         await self._send_or_update_card(chat_id, card, message_id)
 
     async def _cmd_toggle_notify(self, user_id: str, chat_id: str,
                                   message_id: Optional[str] = None):
         """切换就绪通知开关并刷新菜单卡片"""
+        if not self._is_card_mode or not self._poller:
+            await card_service.send_text(chat_id, "此功能仅在卡片模式下可用")
+            return
         new_value = not self._poller.get_notify_enabled()
         self._poller.set_notify_enabled(new_value)
         await self._cmd_menu(user_id, chat_id, message_id=message_id)
@@ -657,6 +791,9 @@ class LarkHandler:
     async def _cmd_toggle_urgent(self, user_id: str, chat_id: str,
                                   message_id: Optional[str] = None):
         """切换加急通知开关并刷新菜单卡片"""
+        if not self._is_card_mode or not self._poller:
+            await card_service.send_text(chat_id, "此功能仅在卡片模式下可用")
+            return
         new_value = not self._poller.get_urgent_enabled()
         self._poller.set_urgent_enabled(new_value)
         await self._cmd_menu(user_id, chat_id, message_id=message_id)
@@ -664,9 +801,436 @@ class LarkHandler:
     async def _cmd_toggle_bypass(self, user_id: str, chat_id: str,
                                   message_id: Optional[str] = None):
         """切换新会话 bypass 开关并刷新菜单卡片"""
+        if not self._is_card_mode or not self._poller:
+            await card_service.send_text(chat_id, "此功能仅在卡片模式下可用")
+            return
         new_value = not self._poller.get_bypass_enabled()
         self._poller.set_bypass_enabled(new_value)
         await self._cmd_menu(user_id, chat_id, message_id=message_id)
+
+    # ── OAuth 授权命令 ──────────────────────────────────────────────────────
+
+    async def _cmd_oauth(self, user_id: str, chat_id: str):
+        """显示 OAuth 授权链接和当前状态"""
+        if not self.oauth_service:
+            await card_service.send_text(chat_id, "用户授权功能未启用。\n请在 .env 中设置 ENABLE_USER_AUTH=true 后重启飞书客户端。")
+            return
+
+        from . import config
+        auth_url = f"http://localhost:{config.OAUTH_SERVER_PORT}/oauth/authorize"
+        token_data = self.oauth_service.get_user_token(user_id)
+
+        if token_data and not self.oauth_service.is_token_expired(token_data):
+            status_text = "✅ 你已授权，token 有效。\n如需重新授权，请点击下方链接。"
+        elif token_data:
+            status_text = "⚠️ 你的授权已过期，请重新授权。"
+        else:
+            status_text = "你尚未授权，点击下方链接完成授权。"
+
+        card = {
+            "schema": "2.0",
+            "config": {"wide_screen_mode": True},
+            "header": _build_header("🔐 用户授权", "blue"),
+            "body": {"elements": [
+                {"tag": "markdown", "content": status_text},
+                {"tag": "markdown", "content": f"**授权页面**: [点击前往授权]({auth_url})"},
+                {"tag": "hr"},
+                {"tag": "markdown", "content": "授权后可使用以用户身份发送消息等高级功能。\n• `/oauth-status` 查看授权状态\n• `/oauth-revoke` 撤销授权"},
+            ]}
+        }
+        await card_service.create_and_send_card(chat_id, card)
+
+    async def _cmd_oauth_status(self, user_id: str, chat_id: str):
+        """查看当前用户的 OAuth 授权状态"""
+        if not self.oauth_service:
+            await card_service.send_text(chat_id, "用户授权功能未启用。")
+            return
+
+        token_data = self.oauth_service.get_user_token(user_id)
+        if not token_data:
+            card = {
+                "schema": "2.0",
+                "config": {"wide_screen_mode": True},
+                "header": _build_header("🔐 授权状态", "grey"),
+                "body": {"elements": [
+                    {"tag": "markdown", "content": "**状态**: 未授权\n\n发送 `/oauth` 获取授权链接。"},
+                ]}
+            }
+            await card_service.create_and_send_card(chat_id, card)
+            return
+
+        expired = self.oauth_service.is_token_expired(token_data)
+        saved_at = token_data.get("saved_at", 0)
+        expires_in = token_data.get("expires_in", 0)
+
+        from datetime import datetime
+        auth_time = datetime.fromtimestamp(saved_at).strftime("%Y-%m-%d %H:%M:%S") if saved_at else "未知"
+        expire_time = datetime.fromtimestamp(saved_at + expires_in).strftime("%Y-%m-%d %H:%M:%S") if saved_at and expires_in else "未知"
+
+        if expired:
+            status_icon = "⚠️"
+            status_text = "已过期"
+            color = "orange"
+        else:
+            status_icon = "✅"
+            status_text = "有效"
+            color = "green"
+
+        info_lines = [
+            f"**状态**: {status_icon} {status_text}",
+            f"**授权时间**: {auth_time}",
+            f"**过期时间**: {expire_time}",
+            f"**Token 预览**: {token_data.get('access_token', '')[:8]}...",
+        ]
+        has_refresh = bool(token_data.get("refresh_token"))
+        info_lines.append(f"**Refresh Token**: {'有' if has_refresh else '无'}")
+
+        card = {
+            "schema": "2.0",
+            "config": {"wide_screen_mode": True},
+            "header": _build_header("🔐 授权状态", color),
+            "body": {"elements": [
+                {"tag": "markdown", "content": "\n".join(info_lines)},
+            ]}
+        }
+        await card_service.create_and_send_card(chat_id, card)
+
+    async def _cmd_oauth_revoke(self, user_id: str, chat_id: str):
+        """撤销当前用户的 OAuth 授权"""
+        if not self.oauth_service:
+            await card_service.send_text(chat_id, "用户授权功能未启用。")
+            return
+
+        removed = self.oauth_service.remove_user_token(user_id)
+        if removed:
+            card = {
+                "schema": "2.0",
+                "config": {"wide_screen_mode": True},
+                "header": _build_header("🔐 授权已撤销", "red"),
+                "body": {"elements": [
+                    {"tag": "markdown", "content": "你的授权已被撤销，token 已删除。\n\n如需重新授权，发送 `/oauth`。"},
+                ]}
+            }
+        else:
+            card = {
+                "schema": "2.0",
+                "config": {"wide_screen_mode": True},
+                "header": _build_header("🔐 撤销授权", "grey"),
+                "body": {"elements": [
+                    {"tag": "markdown", "content": "你当前没有授权记录。"},
+                ]}
+            }
+        await card_service.create_and_send_card(chat_id, card)
+
+    async def _cmd_check_mentions(self, user_id: str, chat_id: str, args: str):
+        """立即检查未回复消息（@消息和私聊）"""
+        if not self.oauth_service:
+            await card_service.send_text(chat_id, "用户授权功能未启用，无法使用消息检测功能。")
+            return
+
+        # 检查是否授权
+        from .user_api import LarkUserApi
+        user_api = LarkUserApi(self.oauth_service)
+        token_status = await user_api.check_token_validity(user_id)
+
+        if not token_status.get("authorized") or not token_status.get("has_valid_token"):
+            card = {
+                "schema": "2.0",
+                "config": {"wide_screen_mode": True},
+                "header": _build_header("🔐 需要授权", "orange"),
+                "body": {"elements": [
+                    {"tag": "markdown", "content": "使用消息检测功能需要先进行 OAuth 授权。\n\n发送 `/oauth` 开始授权流程。"},
+                ]}
+            }
+            await card_service.create_and_send_card(chat_id, card)
+            return
+
+        # 检查是否是 --all 参数
+        check_all = "--all" in args.lower()
+
+        # 解析时间范围参数（支持自然语言）
+        hours_limit = None
+        args_lower = args.lower()
+        import re
+
+        # 匹配 "最近X小时" 或 "X小时" 或 "X hours"
+        time_patterns = [
+            r'最近\s*(\d+)\s*小时',
+            r'(\d+)\s*小时',
+            r'(\d+)\s*hours?',
+            r'past\s+(\d+)\s+hours?',
+        ]
+
+        for pattern in time_patterns:
+            match = re.search(pattern, args_lower)
+            if match:
+                hours_limit = int(match.group(1))
+                break
+
+        # 发送检查中提示
+        time_hint = f"（最近{hours_limit}小时内）" if hours_limit else ""
+        await card_service.send_text(
+            chat_id,
+            f"🔍 正在检查{'所有' if check_all else ''}未回复消息{time_hint}...\n\n"
+            f"📊 检查 30 个群 + 实时私聊消息\n"
+            f"⚡ 预计需要 30-60 秒\n\n"
+            f"💡 私聊消息通过实时推送检测，无需轮询"
+        )
+
+        try:
+            # 执行检查（不设置超时，确保能拿到完整数据）
+            if not hasattr(self, 'mention_poller'):
+                await card_service.send_text(chat_id, "❌ 消息轮询器未初始化")
+                return
+
+            # 直接调用，不设超时
+            mentions = await self.mention_poller.check_now(
+                user_id,
+                notify_chat_id=chat_id,
+                check_all=check_all,
+                hours_limit=hours_limit
+            )
+
+            if not mentions:
+                card = {
+                    "schema": "2.0",
+                    "config": {"wide_screen_mode": True},
+                    "header": _build_header("✅ 没有未回复消息", "green"),
+                    "body": {"elements": [
+                        {"tag": "markdown", "content": "太棒了！所有消息都已回复。"},
+                    ]}
+                }
+            else:
+                # 构建消息列表卡片
+                from .card_builder import build_mentions_card
+                card = build_mentions_card(mentions)
+
+            await card_service.create_and_send_card(chat_id, card)
+
+        except Exception as e:
+            logger.error(f"检查消息失败: {e}", exc_info=True)
+            await card_service.send_text(chat_id, f"❌ 检查失败：{str(e)}")
+
+    async def _cmd_mentions_auto(self, user_id: str, chat_id: str, args: str):
+        """开启/关闭自动检查"""
+        if not hasattr(self, 'config_service') or not hasattr(self, 'mention_poller'):
+            await card_service.send_text(chat_id, "❌ 消息检测功能未初始化")
+            return
+
+        parts = args.strip().split()
+        if not parts or parts[0] not in ("on", "off"):
+            await card_service.send_text(
+                chat_id,
+                "用法: /messages-auto on|off [interval]\n\n"
+                "示例:\n"
+                "  /messages-auto on         # 开启自动检查（默认10分钟）\n"
+                "  /messages-auto on 15      # 开启自动检查，间隔15分钟\n"
+                "  /messages-auto off        # 关闭自动检查"
+            )
+            return
+
+        action = parts[0]
+        interval = int(parts[1]) if len(parts) > 1 else 10
+
+        # 验证间隔
+        if not (5 <= interval <= 60):
+            await card_service.send_text(chat_id, "❌ 检查间隔必须在 5-60 分钟范围内")
+            return
+
+        try:
+            if action == "on":
+                self.config_service.set("mention.auto_check_enabled", True)
+                self.config_service.set("mention.check_interval_minutes", interval)
+                self.config_service.save()
+                self.mention_poller.restart_with_new_interval(interval)
+
+                card = {
+                    "schema": "2.0",
+                    "config": {"wide_screen_mode": True},
+                    "header": _build_header("✅ 自动检查已开启", "green"),
+                    "body": {"elements": [
+                        {"tag": "markdown", "content": f"消息自动检查已开启（@消息和私聊）\n\n检查间隔: **{interval} 分钟**"},
+                    ]}
+                }
+            else:
+                self.config_service.set("mention.auto_check_enabled", False)
+                self.config_service.save()
+                self.mention_poller.stop()
+
+                card = {
+                    "schema": "2.0",
+                    "config": {"wide_screen_mode": True},
+                    "header": _build_header("⏸️ 自动检查已关闭", "grey"),
+                    "body": {"elements": [
+                        {"tag": "markdown", "content": "消息自动检查已关闭"},
+                    ]}
+                }
+
+            await card_service.create_and_send_card(chat_id, card)
+
+        except Exception as e:
+            logger.error(f"设置自动检查失败: {e}", exc_info=True)
+            await card_service.send_text(chat_id, f"❌ 设置失败：{str(e)}")
+
+    async def _cmd_mentions_config(self, user_id: str, chat_id: str, args: str):
+        """配置黑名单/重点群"""
+        if not hasattr(self, 'config_service'):
+            await card_service.send_text(chat_id, "❌ 配置服务未初始化")
+            return
+
+        parts = args.strip().split()
+        if len(parts) < 2:
+            await card_service.send_text(
+                chat_id,
+                "用法: /messages-config blacklist|priority add|remove|list [chat_id]\n\n"
+                "示例:\n"
+                "  /messages-config blacklist list           # 查看黑名单\n"
+                "  /messages-config blacklist add oc_xxx     # 添加到黑名单\n"
+                "  /messages-config blacklist remove oc_xxx  # 从黑名单移除\n"
+                "  /messages-config priority add oc_xxx      # 添加到重点群\n"
+                "  /messages-config priority list            # 查看重点群"
+            )
+            return
+
+        list_type = parts[0]  # blacklist 或 priority
+        action = parts[1]     # add, remove, list
+
+        if list_type not in ("blacklist", "priority"):
+            await card_service.send_text(chat_id, "❌ 列表类型必须是 blacklist 或 priority")
+            return
+
+        list_key = f"mention.{list_type}_chats"
+
+        try:
+            if action == "list":
+                # 列出当前配置
+                items = self.config_service.get_list(list_key)
+                list_name = "黑名单" if list_type == "blacklist" else "重点群"
+
+                if not items:
+                    content = f"{list_name}为空"
+                else:
+                    content = f"{list_name}（共 {len(items)} 个）:\n\n" + "\n".join(f"• `{item}`" for item in items)
+
+                card = {
+                    "schema": "2.0",
+                    "config": {"wide_screen_mode": True},
+                    "header": _build_header(f"📋 {list_name}", "blue"),
+                    "body": {"elements": [
+                        {"tag": "markdown", "content": content},
+                    ]}
+                }
+                await card_service.create_and_send_card(chat_id, card)
+
+            elif action == "add":
+                if len(parts) < 3:
+                    await card_service.send_text(chat_id, "❌ 请提供 chat_id")
+                    return
+
+                chat_id_to_add = parts[2]
+                self.config_service.add_to_list(list_key, chat_id_to_add)
+                self.config_service.save()
+
+                list_name = "黑名单" if list_type == "blacklist" else "重点群"
+                await card_service.send_text(chat_id, f"✅ 已添加到{list_name}: {chat_id_to_add}")
+
+            elif action == "remove":
+                if len(parts) < 3:
+                    await card_service.send_text(chat_id, "❌ 请提供 chat_id")
+                    return
+
+                chat_id_to_remove = parts[2]
+                self.config_service.remove_from_list(list_key, chat_id_to_remove)
+                self.config_service.save()
+
+                list_name = "黑名单" if list_type == "blacklist" else "重点群"
+                await card_service.send_text(chat_id, f"✅ 已从{list_name}移除: {chat_id_to_remove}")
+
+            else:
+                await card_service.send_text(chat_id, "❌ 操作必须是 add, remove 或 list")
+
+        except ValueError as e:
+            await card_service.send_text(chat_id, f"❌ {str(e)}")
+        except Exception as e:
+            logger.error(f"配置失败: {e}", exc_info=True)
+            await card_service.send_text(chat_id, f"❌ 配置失败：{str(e)}")
+
+    async def _cmd_mentions_status(self, user_id: str, chat_id: str):
+        """查看消息检查状态"""
+        if not hasattr(self, 'config_service') or not hasattr(self, 'mention_poller'):
+            await card_service.send_text(chat_id, "❌ 消息检测功能未初始化")
+            return
+
+        try:
+            auto_enabled = self.config_service.get("mention.auto_check_enabled", False)
+            interval = self.config_service.get("mention.check_interval_minutes", 10)
+            last_check = self.mention_poller.state.last_check_time
+            unreplied_count = len(self.mention_poller.state.known_unreplied)
+
+            # 格式化最后检查时间
+            if last_check > 0:
+                from datetime import datetime
+                last_check_dt = datetime.fromtimestamp(last_check / 1000)
+                last_check_str = last_check_dt.strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                last_check_str = "从未检查"
+
+            # 构建状态卡片
+            from .card_builder import build_mention_status_card
+            status_data = {
+                "auto_enabled": auto_enabled,
+                "interval": interval,
+                "last_check": last_check_str,
+                "unreplied_count": unreplied_count
+            }
+            card = build_mention_status_card(status_data)
+            await card_service.create_and_send_card(chat_id, card)
+
+        except Exception as e:
+            logger.error(f"获取状态失败: {e}", exc_info=True)
+            await card_service.send_text(chat_id, f"❌ 获取状态失败：{str(e)}")
+
+    async def _cmd_commands(self, user_id: str, chat_id: str):
+        """显示所有可用命令"""
+        from .card_builder import build_commands_card
+        card = build_commands_card()
+        await card_service.create_and_send_card(chat_id, card)
+
+    async def _cmd_config(self, user_id: str, chat_id: str, args: str):
+        """统一配置管理"""
+        if not hasattr(self, 'config_service'):
+            await card_service.send_text(chat_id, "❌ 配置服务未初始化")
+            return
+
+        parts = args.strip().split(maxsplit=1)
+
+        if not parts:
+            # 显示所有配置
+            from .card_builder import build_config_card
+            card = build_config_card(self.config_service.config)
+            await card_service.create_and_send_card(chat_id, card)
+        else:
+            # 修改配置
+            key = parts[0]
+            value_str = parts[1] if len(parts) > 1 else None
+
+            if not value_str:
+                # 只查询单个配置项
+                value = self.config_service.get(key)
+                await card_service.send_text(chat_id, f"配置项 `{key}`: `{value}`")
+            else:
+                # 设置配置项（自动类型推断）
+                try:
+                    # 尝试解析为 JSON
+                    import json
+                    value = json.loads(value_str)
+                except json.JSONDecodeError:
+                    # 解析失败，作为字符串
+                    value = value_str
+
+                self.config_service.set(key, value)
+                self.config_service.save()
+                await card_service.send_text(chat_id, f"✅ 配置已更新: `{key}` = `{value}`")
 
     async def _cmd_ls(self, user_id: str, chat_id: str, args: str,
                        tree: bool = False, message_id: Optional[str] = None, page: int = 0):
@@ -748,7 +1312,7 @@ class LarkHandler:
             }
             token_resp = urllib.request.urlopen(
                 urllib.request.Request(
-                    "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+                    "https://open.larkoffice.com/open-apis/auth/v3/tenant_access_token/internal",
                     data=_json.dumps({"app_id": config.FEISHU_APP_ID, "app_secret": config.FEISHU_APP_SECRET}).encode(),
                     headers={"Content-Type": "application/json"},
                     method="POST"
@@ -759,7 +1323,7 @@ class LarkHandler:
 
             create_resp = urllib.request.urlopen(
                 urllib.request.Request(
-                    "https://open.feishu.cn/open-apis/im/v1/chats?user_id_type=open_id",
+                    "https://open.larkoffice.com/open-apis/im/v1/chats?user_id_type=open_id",
                     data=_json.dumps(req_body).encode(),
                     headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
                     method="POST"
@@ -794,7 +1358,7 @@ class LarkHandler:
         try:
             token_resp = urllib.request.urlopen(
                 urllib.request.Request(
-                    "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+                    "https://open.larkoffice.com/open-apis/auth/v3/tenant_access_token/internal",
                     data=_json.dumps({"app_id": config.FEISHU_APP_ID, "app_secret": config.FEISHU_APP_SECRET}).encode(),
                     headers={"Content-Type": "application/json"},
                     method="POST"
@@ -804,7 +1368,7 @@ class LarkHandler:
             try:
                 disband_resp = urllib.request.urlopen(
                     urllib.request.Request(
-                        f"https://open.feishu.cn/open-apis/im/v1/chats/{group_chat_id}",
+                        f"https://open.larkoffice.com/open-apis/im/v1/chats/{group_chat_id}",
                         headers={"Authorization": f"Bearer {token}"},
                         method="DELETE"
                     ), timeout=10
@@ -835,7 +1399,7 @@ class LarkHandler:
                 self._chat_bindings.pop(cid, None)
                 disbanded.append(cid)
                 # 停止轮询 + 断开 bridge
-                self._poller.stop(cid)
+                self._stop_poller(cid)
                 bridge = self._bridges.pop(cid, None)
                 if bridge:
                     await bridge.disconnect()
@@ -884,7 +1448,11 @@ class LarkHandler:
     # ── 消息转发 ─────────────────────────────────────────────────────────────
 
     async def _forward_to_claude(self, user_id: str, chat_id: str, text: str):
-        """转发消息给 Claude（输出由 SharedMemoryPoller 自动推卡片）"""
+        """转发消息给 Claude
+
+        卡片模式：冻结当前卡片，回复出现在新卡片
+        文本模式：直接发送输入，由 TextMessagePoller 发送回复
+        """
         bridge = self._bridges.get(chat_id)
 
         if not bridge or not bridge.running:
@@ -913,9 +1481,18 @@ class LarkHandler:
         if not bridge:
             return
 
+        # 卡片模式：冻结当前卡片，让回复出现在新卡片中
+        if self._is_card_mode and self._poller:
+            freeze_result = await self._poller.freeze_current_card(chat_id)
+            logger.info(f"[_forward_to_claude] freeze_current_card 返回: {freeze_result}")
+
+        # 发送用户输入
         success = await bridge.send_input(text)
         if success:
-            self._poller.kick(chat_id)
+            # 文本模式：给用户即时反馈，确认消息已送达
+            if not self._is_card_mode:
+                await card_service.send_interactive_card(chat_id, _build_pending_card(text))
+            self._kick_poller(chat_id)
         else:
             await card_service.send_text(chat_id, "发送失败")
 
@@ -941,7 +1518,7 @@ class LarkHandler:
         max_steps = max(option_total, 10) if option_total > 0 else 10
 
         # 记录初始 option_block 的 block_id，防止跨选项交互误操作
-        initial_snapshot = self._poller.read_snapshot(chat_id)
+        initial_snapshot = self._read_snapshot(chat_id)
         if not initial_snapshot:
             return
         initial_ob = initial_snapshot.get('option_block')
@@ -951,7 +1528,7 @@ class LarkHandler:
 
         for step in range(max_steps):
             # 1. 读取当前选中项
-            snapshot = self._poller.read_snapshot(chat_id)
+            snapshot = self._read_snapshot(chat_id)
             if not snapshot:
                 break
             ob = snapshot.get('option_block')
@@ -969,7 +1546,7 @@ class LarkHandler:
             if not current:
                 for _retry in range(5):  # 最多重试 5 次，共 500ms
                     await asyncio.sleep(0.1)
-                    snap = self._poller.read_snapshot(chat_id)
+                    snap = self._read_snapshot(chat_id)
                     if not snap:
                         break
                     retry_ob = snap.get('option_block')
@@ -983,12 +1560,12 @@ class LarkHandler:
             if current == target:
                 if needs_input:
                     logger.info(f"自由输入选项已到位: target={target}，不发送 Enter")
-                    self._poller.kick(chat_id)
+                    self._kick_poller(chat_id)
                     return
                 logger.info(f"选项已到位: current={current} == target={target}，发送 Enter")
                 success = await bridge.send_raw(b"\r")
                 if success:
-                    self._poller.kick(chat_id)
+                    self._kick_poller(chat_id)
                 else:
                     await card_service.send_text(chat_id, "发送选择失败")
                 return
@@ -1015,7 +1592,7 @@ class LarkHandler:
             deadline = time.time() + 2.0  # 单步超时 2s
             while time.time() < deadline:
                 await asyncio.sleep(0.1)  # 100ms 轮询
-                snap = self._poller.read_snapshot(chat_id)
+                snap = self._read_snapshot(chat_id)
                 if not snap:
                     break
                 new_ob = snap.get('option_block')
@@ -1030,6 +1607,75 @@ class LarkHandler:
 
         # 超过 max_steps 仍未到位，记录警告
         logger.warning(f"选项选择超步数: target={target}, steps={max_steps}")
+
+    def has_active_option(self, chat_id: str) -> bool:
+        """检查当前是否有活跃的 option_block"""
+        snapshot = self._read_snapshot(chat_id)
+        if not snapshot:
+            return False
+        return bool(snapshot.get('option_block'))
+
+    async def handle_option_input(self, user_id: str, chat_id: str, text: str):
+        """处理用户在输入框输入的选项文本
+
+        当有活跃 option_block 时：
+        - 纯数字（如 "1" 或 "2"）→ 导航到该选项并 Enter 确认
+        - 其他文本 → 导航到 "Other" 选项，输入文本后 Enter
+        """
+        logger.info(f"处理选项输入: user={user_id[:8]}..., text={text!r}")
+
+        snapshot = self._read_snapshot(chat_id)
+        if not snapshot:
+            return
+        ob = snapshot.get('option_block')
+        if not ob:
+            return
+
+        options = ob.get('options', [])
+        if not options:
+            return
+
+        text = text.strip()
+
+        # 纯数字 → 直接选择对应选项
+        if text.isdigit():
+            idx = int(text)
+            if 1 <= idx <= len(options):
+                opt = options[idx - 1]
+                value = opt.get('value', str(idx))
+                needs_input = opt.get('needs_input', False)
+                await self.handle_option_select(
+                    user_id, chat_id, value, len(options),
+                    needs_input=needs_input
+                )
+                return
+
+        # 非数字文本 → 找 "Other" 选项（needs_input=True），导航 + 输入文本
+        other_opt = None
+        for opt in options:
+            if opt.get('needs_input', False):
+                other_opt = opt
+                break
+
+        if other_opt:
+            value = other_opt.get('value', '')
+            # 先导航到 Other 选项
+            await self.handle_option_select(
+                user_id, chat_id, value, len(options), needs_input=True
+            )
+            # 等待导航完成
+            await asyncio.sleep(0.3)
+            # 输入文本
+            bridge = self._bridges.get(chat_id)
+            if bridge and bridge.running:
+                await bridge.send_input(text)
+                await asyncio.sleep(0.1)
+                # 发 Enter 提交
+                await bridge.send_raw(b"\r")
+                self._kick_poller(chat_id)
+        else:
+            # 没有 Other 选项，直接把文本当作输入发给 Claude
+            await self._forward_to_claude(user_id, chat_id, text)
 
     # ── 快捷键发送 ─────────────────────────────────────────────────────────────
 
@@ -1059,7 +1705,7 @@ class LarkHandler:
         success = await bridge.send_raw(raw)
         if success:
             logger.info(f"已发送快捷键 {key_name} 到 Claude")
-            self._poller.kick(chat_id)
+            self._kick_poller(chat_id)
         else:
             logger.warning(f"发送快捷键 {key_name} 失败")
 
@@ -1123,12 +1769,12 @@ class LarkHandler:
         return entries
 
     async def disconnect_all_for_shutdown(self) -> None:
-        """lark stop 时清理所有活跃流式卡片（更新为已断开状态）"""
+        """lark stop 时清理所有活跃流式卡片（更新为已断开状态，仅卡片模式）"""
         chat_ids = list(self._bridges.keys())
         for chat_id in chat_ids:
             session_name = self._chat_sessions.get(chat_id, "")
-            active_slice = self._poller.stop_and_get_active_slice(chat_id)
-            if active_slice and session_name:
+            active_slice = self._stop_poller(chat_id)
+            if active_slice and session_name and self._is_card_mode:
                 await self._update_card_disconnected(chat_id, session_name, active_slice)
 
     @staticmethod
@@ -1145,6 +1791,348 @@ class LarkHandler:
         except Exception:
             pass
         return None
+
+    # ── 监听管理命令 ───────────────────────────────────────────────────────────
+
+    async def _cmd_monitor(self, user_id: str, chat_id: str, args: str):
+        """处理 /monitor 命令路由"""
+        parts = args.split(maxsplit=2) if args else []
+        subcommand = parts[0].lower() if parts else ""
+
+        if subcommand == "add":
+            await self._cmd_monitor_add(user_id, chat_id)
+        elif subcommand == "list":
+            await self._cmd_monitor_list(user_id, chat_id)
+        elif subcommand == "remove":
+            index_str = parts[1] if len(parts) > 1 else ""
+            await self._cmd_monitor_remove(user_id, chat_id, index_str)
+        elif subcommand == "config":
+            # 如果有额外参数，处理配置更新
+            if len(parts) > 1:
+                config_args = " ".join(parts[1:])
+                await self._cmd_monitor_config_update(user_id, chat_id, config_args)
+            else:
+                # 显示配置卡片
+                await self._cmd_monitor_config(user_id, chat_id)
+        else:
+            # 显示帮助信息
+            await card_service.send_text(
+                chat_id,
+                "📋 监听管理命令\n\n"
+                "• `/monitor add` - 添加当前群聊到监听列表\n"
+                "• `/monitor list` - 查看监听列表\n"
+                "• `/monitor remove <序号>` - 删除指定群聊\n"
+                "• `/monitor config` - 查看配置\n"
+                "• `/monitor config interval <分钟>` - 设置检查间隔\n"
+                "• `/monitor config quiet <开始> <结束>` - 设置静默时段"
+            )
+
+    async def _cmd_monitor_add(self, user_id: str, chat_id: str):
+        """添加当前群聊到监听列表"""
+        try:
+            # 1. 获取群聊信息
+            if not self.user_api or not self.oauth_service:
+                await card_service.send_text(
+                    chat_id,
+                    "❌ 监听功能需要用户授权，请先执行 `/oauth` 完成授权。"
+                )
+                return
+
+            # 获取用户 token
+            token_data = self.oauth_service.get_user_token(user_id)
+            if not token_data:
+                await card_service.send_text(
+                    chat_id,
+                    "❌ 未找到授权信息，请先执行 `/oauth` 完成授权。"
+                )
+                return
+
+            # 获取群聊信息
+            try:
+                from .user_api import TokenExpiredError
+                chat_info = await self.user_api.get_chat_info(
+                    user_id,
+                    chat_id
+                )
+                chat_name = chat_info.get('name', '未知群聊')
+            except TokenExpiredError as e:
+                logger.warning(f"用户 token 未授权或已过期: {e}")
+                await card_service.send_text(
+                    chat_id,
+                    "🔐 **需要授权才能使用监听功能**\n\n"
+                    "监听功能需要以您的身份读取群聊消息，请先完成授权：\n\n"
+                    "**1️⃣ 获取授权链接**\n"
+                    "在本对话中输入：`/oauth`\n\n"
+                    "**2️⃣ 完成授权**\n"
+                    "点击返回的链接，同意授权后复制授权码\n\n"
+                    "**3️⃣ 提交授权码**\n"
+                    "输入：`/oauth <授权码>`\n\n"
+                    "授权完成后，再次执行 `/monitor add` 即可添加监听。"
+                )
+                return
+            except Exception as e:
+                logger.error(f"获取群聊信息失败: {e}")
+                await card_service.send_text(
+                    chat_id,
+                    f"❌ 获取群聊信息失败: {str(e)}\n\n"
+                    f"请确认机器人在该群聊中有权读取信息。\n"
+                    f"如果授权已过期，请执行 `/oauth` 重新授权。"
+                )
+                return
+
+            # 2. 添加到配置
+            chat_data = {
+                'chat_id': chat_id,
+                'chat_name': chat_name,
+                'chat_type': 'group',
+                'added_at': int(time.time()),
+                'last_check_time': 0
+            }
+
+            success = self.monitor_config.add_chat(user_id, chat_data)
+
+            # 3. 发送确认消息
+            if success:
+                await card_service.send_text(
+                    chat_id,
+                    f"✅ 已添加群聊「{chat_name}」到监听列表\n\n"
+                    f"系统将定时检查该群的新消息并推送摘要给您。\n"
+                    f"使用 `/monitor list` 查看监听列表。"
+                )
+                logger.info(f"[监听] 用户 {user_id[:8]}... 添加群聊: {chat_name} ({chat_id[:8]}...)")
+            else:
+                await card_service.send_text(
+                    chat_id,
+                    f"ℹ️ 群聊「{chat_name}」已在监听列表中"
+                )
+
+        except Exception as e:
+            logger.error(f"添加监听群聊失败: {e}", exc_info=True)
+            await card_service.send_text(
+                chat_id,
+                f"❌ 添加监听失败: {str(e)}"
+            )
+
+    async def _cmd_monitor_list(self, user_id: str, chat_id: str):
+        """查看监听列表"""
+        try:
+            config = self.monitor_config.get_user_config(user_id)
+            monitored_chats = config.get('monitored_chats', [])
+
+            # 构建卡片
+            card = build_monitor_list_card(monitored_chats)
+            await card_service.send_card(chat_id, card)
+
+        except Exception as e:
+            logger.error(f"查看监听列表失败: {e}", exc_info=True)
+            await card_service.send_text(
+                chat_id,
+                f"❌ 查看监听列表失败: {str(e)}"
+            )
+
+    async def _cmd_monitor_remove(self, user_id: str, chat_id: str, index_str: str):
+        """删除监听的群聊"""
+        try:
+            # 验证序号
+            if not index_str or not index_str.isdigit():
+                await card_service.send_text(
+                    chat_id,
+                    "❌ 请指定要删除的群聊序号\n\n"
+                    "用法: `/monitor remove <序号>`\n"
+                    "例如: `/monitor remove 1`"
+                )
+                return
+
+            index = int(index_str)
+
+            # 获取当前配置
+            config = self.monitor_config.get_user_config(user_id)
+            monitored_chats = config.get('monitored_chats', [])
+
+            # 验证序号范围
+            if index < 1 or index > len(monitored_chats):
+                await card_service.send_text(
+                    chat_id,
+                    f"❌ 序号无效: {index}\n\n"
+                    f"请输入 1-{len(monitored_chats)} 之间的序号"
+                )
+                return
+
+            # 获取要删除的群聊信息
+            chat_to_remove = monitored_chats[index - 1]
+            chat_name = chat_to_remove.get('chat_name', '未知群聊')
+
+            # 删除
+            success = self.monitor_config.remove_chat(user_id, index)
+
+            if success:
+                await card_service.send_text(
+                    chat_id,
+                    f"✅ 已从监听列表中移除「{chat_name}」\n\n"
+                    f"使用 `/monitor list` 查看当前列表。"
+                )
+                logger.info(f"[监听] 用户 {user_id[:8]}... 移除群聊: {chat_name}")
+            else:
+                await card_service.send_text(
+                    chat_id,
+                    f"❌ 删除失败: 群聊序号 {index} 不存在"
+                )
+
+        except Exception as e:
+            logger.error(f"删除监听群聊失败: {e}", exc_info=True)
+            await card_service.send_text(
+                chat_id,
+                f"❌ 删除监听失败: {str(e)}"
+            )
+
+    async def _cmd_monitor_config(self, user_id: str, chat_id: str):
+        """显示监听配置"""
+        try:
+            config = self.monitor_config.get_user_config(user_id)
+
+            # 导入 build_monitor_config_card
+            from .card_builder import build_monitor_config_card
+            card = build_monitor_config_card(config)
+            await card_service.send_card(chat_id, card)
+
+        except Exception as e:
+            logger.error(f"查看监听配置失败: {e}", exc_info=True)
+            await card_service.send_text(
+                chat_id,
+                f"❌ 查看配置失败: {str(e)}"
+            )
+
+    async def _cmd_monitor_config_update(self, user_id: str, chat_id: str, args: str):
+        """更新监听配置"""
+        try:
+            parts = args.split()
+            if not parts:
+                await card_service.send_text(
+                    chat_id,
+                    "❌ 请指定配置项\n\n"
+                    "用法:\n"
+                    "• `/monitor config interval <分钟>` - 设置检查间隔（5/10/15/30）\n"
+                    "• `/monitor config quiet <开始> <结束>` - 设置静默时段\n"
+                    "• `/monitor config quiet off` - 关闭静默时段"
+                )
+                return
+
+            config_type = parts[0].lower()
+
+            if config_type == "interval":
+                # 设置检查间隔
+                if len(parts) < 2:
+                    await card_service.send_text(
+                        chat_id,
+                        "❌ 请指定检查间隔（分钟）\n\n"
+                        "用法: `/monitor config interval <分钟>`\n"
+                        "支持: 5, 10, 15, 30"
+                    )
+                    return
+
+                try:
+                    interval = int(parts[1])
+                    success = self.monitor_config.update_check_interval(user_id, interval)
+
+                    if success:
+                        await card_service.send_text(
+                            chat_id,
+                            f"✅ 检查间隔已更新为 {interval} 分钟"
+                        )
+                        logger.info(f"[监听配置] 用户 {user_id[:8]}... 更新间隔: {interval}分钟")
+                    else:
+                        await card_service.send_text(
+                            chat_id,
+                            f"❌ 无效的间隔值: {interval}\n\n"
+                            f"支持的值: 5, 10, 15, 30"
+                        )
+                except ValueError:
+                    await card_service.send_text(
+                        chat_id,
+                        "❌ 间隔值必须为数字"
+                    )
+
+            elif config_type == "quiet":
+                # 设置静默时段
+                if len(parts) < 2:
+                    await card_service.send_text(
+                        chat_id,
+                        "❌ 请指定静默时段\n\n"
+                        "用法:\n"
+                        "• `/monitor config quiet <开始> <结束>` - 设置时段（如 22:00 08:00）\n"
+                        "• `/monitor config quiet off` - 关闭静默时段"
+                    )
+                    return
+
+                if parts[1].lower() == "off":
+                    # 关闭静默时段
+                    settings = {"enabled": False}
+                    success = self.monitor_config.update_quiet_hours(user_id, settings)
+
+                    if success:
+                        await card_service.send_text(
+                            chat_id,
+                            "✅ 静默时段已关闭"
+                        )
+                        logger.info(f"[监听配置] 用户 {user_id[:8]}... 关闭静默时段")
+                    else:
+                        await card_service.send_text(
+                            chat_id,
+                            "❌ 更新配置失败"
+                        )
+                else:
+                    # 设置静默时段
+                    if len(parts) < 3:
+                        await card_service.send_text(
+                            chat_id,
+                            "❌ 请同时指定开始和结束时间\n\n"
+                            "用法: `/monitor config quiet <开始> <结束>`\n"
+                            "示例: `/monitor config quiet 22:00 08:00`"
+                        )
+                        return
+
+                    start_time = parts[1]
+                    end_time = parts[2]
+
+                    settings = {
+                        "enabled": True,
+                        "start": start_time,
+                        "end": end_time
+                    }
+
+                    success = self.monitor_config.update_quiet_hours(user_id, settings)
+
+                    if success:
+                        await card_service.send_text(
+                            chat_id,
+                            f"✅ 静默时段已更新\n\n"
+                            f"• 开始: {start_time}\n"
+                            f"• 结束: {end_time}\n\n"
+                            f"在此时段内将不会推送消息摘要"
+                        )
+                        logger.info(
+                            f"[监听配置] 用户 {user_id[:8]}... "
+                            f"更新静默时段: {start_time} - {end_time}"
+                        )
+                    else:
+                        await card_service.send_text(
+                            chat_id,
+                            "❌ 更新配置失败\n\n"
+                            "请检查时间格式（应为 HH:MM，如 22:00）"
+                        )
+            else:
+                await card_service.send_text(
+                    chat_id,
+                    f"❌ 未知的配置项: {config_type}\n\n"
+                    f"支持的配置项: interval, quiet"
+                )
+
+        except Exception as e:
+            logger.error(f"更新监听配置失败: {e}", exc_info=True)
+            await card_service.send_text(
+                chat_id,
+                f"❌ 更新配置失败: {str(e)}"
+            )
 
 
 # 全局处理器实例

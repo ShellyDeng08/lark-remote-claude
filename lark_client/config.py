@@ -52,3 +52,16 @@ LARK_LOG_LEVEL = {
 # SOCKS 代理兼容（可选，默认 False）
 # 系统有 SOCKS 代理但飞书可直连时，设为 1 绕过代理
 LARK_NO_PROXY = os.getenv("LARK_NO_PROXY", "").strip() in ("1", "true", "yes")
+
+# ---- 用户 OAuth 授权配置 ----
+# 是否启用用户授权模式（允许用户通过 OAuth 授权后以个人身份调用飞书 API）
+ENABLE_USER_AUTH = os.getenv("ENABLE_USER_AUTH", "false").lower() in ("1", "true", "yes")
+
+# OAuth 回调服务器端口
+OAUTH_SERVER_PORT = int(os.getenv("OAUTH_SERVER_PORT", "8080"))
+
+# OAuth 重定向 URI（需与飞书开放平台应用配置一致）
+OAUTH_REDIRECT_URI = os.getenv(
+    "OAUTH_REDIRECT_URI",
+    f"http://localhost:{OAUTH_SERVER_PORT}/oauth/callback",
+)

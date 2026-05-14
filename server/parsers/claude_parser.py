@@ -764,6 +764,10 @@ class ClaudeParser(BaseParser):
                 ansi_content=ansi_content, indicator=ind, ansi_indicator=ansi_ind,
             )
 
+        # Box 底角字符（└╰）独立出现（非 box 模式内）：Claude CLI 本地命令输出（/cost、/model 等）
+        if col0 in BOX_CORNER_BOTTOM:
+            return self._parse_system_block(screen, first_row, block_rows, lines, col0)
+
         # 其他首列字符（装饰残留、欢迎区片段等），忽略
         return None
 

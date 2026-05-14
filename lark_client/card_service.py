@@ -14,6 +14,7 @@ import lark_oapi as lark
 logger = logging.getLogger('CardService')
 from lark_oapi.api.im.v1 import (
     CreateMessageRequest, CreateMessageRequestBody,
+    GetMessageResourceRequest,
 )
 from lark_oapi.api.cardkit.v1 import (
     CreateCardRequest, CreateCardRequestBody,
@@ -314,6 +315,87 @@ class CardService:
             logger.error(f"发送文本异常: {e}")
             return None
 
+    async def send_post(self, chat_id: str, markdown: str, title: str = "") -> Optional[str]:
+        """发送富文本消息（支持 Markdown 渲染），返回 message_id（失败返回 None）
+
+        使用飞书 post 消息类型的 md 标签，支持：
+        - 加粗 **bold**、斜体 *italic*、删除线 ~~strike~~
+        - 有序/无序列表
+        - 代码块 ```language ... ```
+        - 表格 | col1 | col2 |
+        """
+        if not self.client:
+            print(f"[Lark] 富文本: {markdown[:100]}")
+            return None
+
+        try:
+            import asyncio
+
+            content = {
+                "zh_cn": {
+                    "title": title,
+                    "content": [[{"tag": "md", "text": markdown}]]
+                }
+            }
+
+            request = CreateMessageRequest.builder() \
+                .receive_id_type("chat_id") \
+                .request_body(
+                    CreateMessageRequestBody.builder()
+                    .receive_id(chat_id)
+                    .msg_type("post")
+                    .content(json.dumps(content))
+                    .build()
+                ) \
+                .build()
+
+            response = await asyncio.to_thread(
+                self.client.im.v1.message.create, request
+            )
+
+            if response.success():
+                return getattr(getattr(response, "data", None), "message_id", None)
+            else:
+                logger.warning(f"发送富文本失败: code={response.code} msg={response.msg}")
+                # 降级为纯文本
+                return await self.send_text(chat_id, markdown)
+        except Exception as e:
+            logger.error(f"发送富文本异常: {e}")
+            return None
+
+    async def send_interactive_card(self, chat_id: str, card_json: dict) -> Optional[str]:
+        """直接发送 interactive 卡片 JSON（不经 cardkit create），返回 message_id"""
+        if not self.client:
+            print(f"[Lark] 交互卡片: {json.dumps(card_json, ensure_ascii=False)[:100]}")
+            return None
+
+        try:
+            import asyncio
+
+            request = CreateMessageRequest.builder() \
+                .receive_id_type("chat_id") \
+                .request_body(
+                    CreateMessageRequestBody.builder()
+                    .receive_id(chat_id)
+                    .msg_type("interactive")
+                    .content(json.dumps(card_json))
+                    .build()
+                ) \
+                .build()
+
+            response = await asyncio.to_thread(
+                self.client.im.v1.message.create, request
+            )
+
+            if response.success():
+                return getattr(getattr(response, "data", None), "message_id", None)
+            else:
+                logger.warning(f"发送交互卡片失败: code={response.code} msg={response.msg}")
+                return None
+        except Exception as e:
+            logger.error(f"发送交互卡片异常: {e}")
+            return None
+
     # 管理活跃卡片的方法
     def get_active_card(self, chat_id: str) -> Optional[CardState]:
         """获取聊天的活跃卡片"""
@@ -327,6 +409,44 @@ class CardService:
         """清除聊天的活跃卡片"""
         if chat_id in self._active_cards:
             del self._active_cards[chat_id]
+
+    async def download_image(self, message_id: str, image_key: str) -> Optional[str]:
+        """下载飞书图片到本地临时文件，返回本地文件路径"""
+        if not self.client:
+            logger.error("客户端未初始化，无法下载图片")
+            return None
+        try:
+            import os
+            import asyncio
+            import tempfile
+            # 确保图片目录存在
+            img_dir = os.path.join(tempfile.gettempdir(), "remote-claude", "images")
+            os.makedirs(img_dir, exist_ok=True)
+            local_path = os.path.join(img_dir, f"{image_key}.png")
+
+            # 如果已下载则直接返回
+            if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+                return local_path
+
+            request = GetMessageResourceRequest.builder() \
+                .message_id(message_id) \
+                .file_key(image_key) \
+                .type("image") \
+                .build()
+            response = await asyncio.to_thread(self.client.im.v1.message_resource.get, request)
+            if not response or not response.success():
+                msg = getattr(response, 'msg', 'unknown') if response else 'no response'
+                logger.error(f"下载图片失败: {msg}")
+                return None
+
+            # 写入文件
+            with open(local_path, 'wb') as f:
+                f.write(response.file.read())
+            logger.info(f"图片已下载: {local_path} ({os.path.getsize(local_path)} bytes)")
+            return local_path
+        except Exception as e:
+            logger.error(f"下载图片异常: {e}")
+            return None
 
 
 # 全局实例

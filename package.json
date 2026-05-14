@@ -1,6 +1,6 @@
 {
-  "name": "remote-claude",
-  "version": "1.0.3",
+  "name": "lark-remote-claude",
+  "version": "1.0.0",
   "description": "双端共享 Claude CLI 工具",
   "bin": {
     "remote-claude": "bin/remote-claude",
@@ -13,8 +13,11 @@
   },
   "files": [
     "bin/",
-    "scripts/*.sh",
-    "scripts/*.py",
+    "scripts/preinstall.sh",
+    "scripts/postinstall.sh",
+    "scripts/check-env.sh",
+    "scripts/completion.sh",
+    "scripts/report_install.py",
     "init.sh",
     "remote_claude.py",
     "server/*.py",
@@ -35,7 +38,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/yyzybb537/remote_claude.git"
+    "url": "git+https://github.com/ShellyDeng08/remote_claude.git"
   },
   "keywords": [
     "claude",

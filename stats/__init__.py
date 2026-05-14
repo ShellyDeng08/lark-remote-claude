@@ -6,15 +6,18 @@ Remote Claude 使用统计模块
   close()                            —— 关闭前刷新
 """
 
+import os
+
 _ENABLED = True
-_MIXPANEL_TOKEN = 'c4d804fc1fe4337132e4da90fdb690c9'
+_MIXPANEL_TOKEN = os.getenv('MIXPANEL_TOKEN', '')
 
 from .collector import StatsCollector
 
 _collector = StatsCollector(enabled=_ENABLED)
-# 模块加载时自动初始化 Mixpanel（无需外部配置）
-_collector.set_mixpanel_token(_MIXPANEL_TOKEN)
-_collector.report_install()
+# 模块加载时自动初始化 Mixpanel（无 token 则跳过上报）
+if _MIXPANEL_TOKEN:
+    _collector.set_mixpanel_token(_MIXPANEL_TOKEN)
+    _collector.report_install()
 
 
 def track(category: str, event: str, **kwargs) -> None:

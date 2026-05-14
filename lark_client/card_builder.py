@@ -5,7 +5,7 @@
 - build_stream_card(blocks, ...)：从共享内存 blocks 流构建飞书卡片（供 SharedMemoryPoller 调用）
 
 辅助卡片：
-- build_menu_card（内嵌会话列表 + 快捷操作，/menu 和 /list 共用）
+- build_menu_card（会话列表，/menu 和 /list 共用）
 - build_status_card / build_help_card / build_dir_card / build_session_closed_card
 """
 
@@ -402,41 +402,16 @@ def _build_menu_button_only() -> Dict[str, Any]:
 
 
 def _build_buttons_v2(options: List[Dict[str, str]]) -> List[Dict[str, Any]]:
-    """Schema 2.0 按钮组：每个按钮独占一行，顶部加一条 hr"""
-    total = len(options)
+    """Schema 2.0 选项区：文字列表 + 输入提示（替代按钮，统一手机/桌面交互）"""
     elements = [{"tag": "hr"}]
+    # 选项列表（纯文本）
+    lines = []
     for i, opt in enumerate(options):
-        btn_type = "primary" if i == 0 else "default"
-        elements.append({
-            "tag": "column_set",
-            "flex_mode": "none",
-            "columns": [
-                {
-                    "tag": "column",
-                    "width": "weighted",
-                    "weight": 1,
-                    "horizontal_align": "left",
-                    "elements": [
-                        {
-                            "tag": "button",
-                            "text": {"tag": "plain_text", "content": f"{i+1}. {opt['label']}"},
-                            "type": btn_type,
-                            "behaviors": [
-                                {
-                                    "type": "callback",
-                                    "value": {
-                                        "action": "select_option",
-                                        "value": opt["value"],
-                                        "needs_input": opt.get("needs_input", False),
-                                        "total": str(total),
-                                    }
-                                }
-                            ]
-                        }
-                    ]
-                }
-            ]
-        })
+        label = opt.get("label", "")
+        lines.append(f"**{i+1}.** {_escape_md(label)}")
+    lines.append("")
+    lines.append("<font color=\"grey\">在输入框输入编号选择，或直接打字回复</font>")
+    elements.append({"tag": "markdown", "content": "\n".join(lines)})
     return elements
 
 
@@ -771,7 +746,7 @@ def build_stream_card(
 
 # === 辅助卡片（保留不变）===
 
-def _build_session_list_elements(sessions: List[Dict], current_session: Optional[str], session_groups: Optional[Dict[str, str]], page: int = 0) -> List[Dict]:
+def _build_session_list_elements(sessions: List[Dict], current_session: Optional[str], session_groups: Optional[Dict[str, str]] = None, page: int = 0) -> List[Dict]:
     """构建会话列表元素（供 build_menu_card 复用）"""
     import os
     elements = []
@@ -824,9 +799,7 @@ def _build_session_list_elements(sessions: List[Dict], current_session: Optional
                 btn_label = "进入会话"
                 btn_type = "primary"
                 btn_action = "list_attach"
-            has_group = bool(session_groups and name in session_groups)
-
-            # 右列按钮（纵向堆叠）
+            # 右列：单个按钮
             right_buttons = [
                 {
                     "tag": "button",
@@ -836,40 +809,7 @@ def _build_session_list_elements(sessions: List[Dict], current_session: Optional
                         "action": btn_action, "session": name
                     }}]
                 },
-                {
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": "进入群聊" if has_group else "创建群聊"},
-                    "type": "default",
-                    "behaviors": [{"type": "open_url",
-                                   "default_url": f"https://applink.feishu.cn/client/chat/open?openChatId={session_groups[name]}",
-                                   "android_url": f"https://applink.feishu.cn/client/chat/open?openChatId={session_groups[name]}",
-                                   "ios_url": f"https://applink.feishu.cn/client/chat/open?openChatId={session_groups[name]}",
-                                   "pc_url": f"https://applink.feishu.cn/client/chat/open?openChatId={session_groups[name]}"}]
-                    if has_group else
-                    [{"type": "callback", "value": {"action": "list_new_group", "session": name}}]
-                },
             ]
-            if has_group:
-                right_buttons.append({
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": "解散群聊"},
-                    "type": "danger",
-                    "behaviors": [{"type": "callback", "value": {
-                        "action": "list_disband_group", "session": name
-                    }}]
-                })
-            right_buttons.append({
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": "🗑️ 关闭"},
-                "type": "danger",
-                "confirm": {
-                    "title": {"tag": "plain_text", "content": "确认关闭会话"},
-                    "text": {"tag": "plain_text", "content": f"确定要关闭「{name}」吗？此操作不可撤销。"}
-                },
-                "behaviors": [{"type": "callback", "value": {
-                    "action": "list_kill", "session": name
-                }}]
-            })
             elements.append({
                 "tag": "column_set",
                 "flex_mode": "none",
@@ -1152,6 +1092,11 @@ def build_help_card() -> Dict[str, Any]:
 **群聊协作**
 • `/new-group <会话名>` - 创建专属群聊，多人共用同一 Claude
 
+**用户授权**
+• `/oauth` - 获取授权链接（以个人身份使用飞书 API）
+• `/oauth-status` - 查看授权状态
+• `/oauth-revoke` - 撤销授权
+
 **其他**
 • `/help` - 显示此帮助
 • `/menu` - 快捷操作面板"""
@@ -1209,17 +1154,19 @@ def build_session_closed_card(session_name: str) -> Dict[str, Any]:
 
 def build_menu_card(sessions: List[Dict], current_session: Optional[str] = None,
                     session_groups: Optional[Dict[str, str]] = None, page: int = 0,
-                    notify_enabled: bool = True, urgent_enabled: bool = False,
-                    bypass_enabled: bool = False) -> Dict[str, Any]:
-    """构建快捷操作菜单卡片（/menu 和 /list 共用）：内嵌会话列表 + 快捷操作"""
+                    **_kwargs) -> Dict[str, Any]:
+    """构建菜单卡片（/menu 和 /list 共用）：会话列表 + 功能按钮"""
     elements = []
 
     elements.append({"tag": "markdown", "content": "**会话管理**"})
     elements.append({"tag": "hr"})
     elements.extend(_build_session_list_elements(sessions, current_session, session_groups, page=page))
 
+    # 功能按钮区
     elements.append({"tag": "hr"})
-    elements.append({"tag": "markdown", "content": "**快捷操作**"})
+    elements.append({"tag": "markdown", "content": "**快捷功能**"})
+
+    # 第一行：常用功能
     elements.append({
         "tag": "column_set",
         "flex_mode": "none",
@@ -1232,6 +1179,7 @@ def build_menu_card(sessions: List[Dict], current_session: Optional[str] = None,
                     "tag": "button",
                     "text": {"tag": "plain_text", "content": "📂 文件列表"},
                     "type": "default",
+                    "width": "fill",
                     "behaviors": [{"type": "callback", "value": {"action": "menu_ls"}}]
                 }]
             },
@@ -1243,48 +1191,14 @@ def build_menu_card(sessions: List[Dict], current_session: Optional[str] = None,
                     "tag": "button",
                     "text": {"tag": "plain_text", "content": "🌲 目录树"},
                     "type": "default",
+                    "width": "fill",
                     "behaviors": [{"type": "callback", "value": {"action": "menu_tree"}}]
-                }]
-            },
-            {
-                "tag": "column",
-                "width": "weighted",
-                "weight": 1,
-                "elements": [{
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": "🔄 刷新"},
-                    "type": "default",
-                    "behaviors": [{"type": "callback", "value": {"action": "menu_open"}}]
                 }]
             },
         ]
     })
 
-    notify_label = "🔔 完成通知: 开" if notify_enabled else "🔕 完成通知: 关"
-    if not notify_enabled:
-        urgent_label = "🔇 加急通知: 关"
-        urgent_button: Dict[str, Any] = {
-            "tag": "button",
-            "text": {"tag": "plain_text", "content": urgent_label},
-            "type": "default",
-            "disabled": True,
-        }
-    elif urgent_enabled:
-        urgent_label = "🔔 加急通知: 开"
-        urgent_button = {
-            "tag": "button",
-            "text": {"tag": "plain_text", "content": urgent_label},
-            "type": "default",
-            "behaviors": [{"type": "callback", "value": {"action": "menu_toggle_urgent"}}]
-        }
-    else:
-        urgent_label = "🔕 加急通知: 关"
-        urgent_button = {
-            "tag": "button",
-            "text": {"tag": "plain_text", "content": urgent_label},
-            "type": "default",
-            "behaviors": [{"type": "callback", "value": {"action": "menu_toggle_urgent"}}]
-        }
+    # 第二行：信息类
     elements.append({
         "tag": "column_set",
         "flex_mode": "none",
@@ -1295,31 +1209,510 @@ def build_menu_card(sessions: List[Dict], current_session: Optional[str] = None,
                 "weight": 1,
                 "elements": [{
                     "tag": "button",
-                    "text": {"tag": "plain_text", "content": notify_label},
+                    "text": {"tag": "plain_text", "content": "📊 当前状态"},
                     "type": "default",
-                    "behaviors": [{"type": "callback", "value": {"action": "menu_toggle_notify"}}]
+                    "width": "fill",
+                    "behaviors": [{"type": "callback", "value": {"action": "menu_status"}}]
                 }]
             },
             {
                 "tag": "column",
                 "width": "weighted",
                 "weight": 1,
-                "elements": [urgent_button]
+                "elements": [{
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "❓ 帮助"},
+                    "type": "default",
+                    "width": "fill",
+                    "behaviors": [{"type": "callback", "value": {"action": "menu_help"}}]
+                }]
             },
         ]
-    })
-
-    bypass_label = "🔓 新会话bypass: 开" if bypass_enabled else "🔒 新会话bypass: 关"
-    elements.append({
-        "tag": "button",
-        "text": {"tag": "plain_text", "content": bypass_label},
-        "type": "default",
-        "behaviors": [{"type": "callback", "value": {"action": "menu_toggle_bypass"}}]
     })
 
     return {
         "schema": "2.0",
         "config": {"wide_screen_mode": True},
-        "header": _build_header("⚡ 快捷操作", "turquoise"),
+        "header": _build_header("⚡ 菜单", "turquoise"),
+        "body": {"elements": elements}
+    }
+
+
+# ── @消息检测相关卡片 ─────────────────────────────────────────────────────
+
+
+def build_mentions_card(mentions: List) -> dict:
+    """构建@消息/私聊消息列表卡片
+
+    Args:
+        mentions: MentionInfo 列表
+
+    Returns:
+        飞书卡片 JSON
+    """
+    elements = []
+
+    if not mentions:
+        elements.append({
+            "tag": "markdown",
+            "content": "太棒了！所有消息都已回复。"
+        })
+    else:
+        # 分类统计
+        at_mentions = [m for m in mentions if getattr(m, 'message_type', 'mention') == 'mention']
+        dm_messages = [m for m in mentions if getattr(m, 'message_type', 'mention') == 'dm']
+
+        # 显示数量
+        summary_parts = []
+        if at_mentions:
+            summary_parts.append(f"**{len(at_mentions)}** 条@消息")
+        if dm_messages:
+            summary_parts.append(f"**{len(dm_messages)}** 条私聊")
+
+        elements.append({
+            "tag": "markdown",
+            "content": f"发现未回复消息：{' 和 '.join(summary_parts)}"
+        })
+
+        # 按时间降序排序（最新的在前面）
+        sorted_mentions = sorted(mentions, key=lambda m: m.time, reverse=True)
+
+        # 限制显示数量（最多10条）
+        display_mentions = sorted_mentions[:10]
+        has_more = len(sorted_mentions) > 10
+
+        for mention in display_mentions:
+            from datetime import datetime
+            msg_time = datetime.fromtimestamp(mention.time / 1000)
+            time_str = msg_time.strftime("%m-%d %H:%M")
+
+            # 截取消息内容（最多200字）
+            text = mention.text if len(mention.text) <= 200 else mention.text[:200] + "..."
+
+            # 根据类型选择图标
+            msg_type = getattr(mention, 'message_type', 'mention')
+            if msg_type == "dm":
+                icon = "💬"
+            else:
+                icon = "📢"
+
+            # 构建简洁的消息卡片元素
+            elements.append({"tag": "hr"})
+
+            # 群名称 + 时间 + 打开链接
+            elements.append({
+                "tag": "div",
+                "fields": [
+                    {
+                        "is_short": True,
+                        "text": {
+                            "tag": "lark_md",
+                            "content": f"**{mention.chat_name}**"
+                        }
+                    },
+                    {
+                        "is_short": True,
+                        "text": {
+                            "tag": "lark_md",
+                            "content": f"[打开群聊]({mention.chat_link})"
+                        }
+                    }
+                ]
+            })
+
+            # 用户名称：消息内容
+            sender_display = mention.sender_name if mention.sender_name != "未知用户" else f"用户({mention.sender_id[:8]}...)"
+            elements.append({
+                "tag": "markdown",
+                "content": f"**{sender_display}**：{text}\n\n*⏰ {time_str}*"
+            })
+
+        if has_more:
+            elements.append({"tag": "hr"})
+            elements.append({
+                "tag": "markdown",
+                "content": f"还有 {len(sorted_mentions) - 10} 条消息未显示..."
+            })
+
+    return {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True},
+        "header": _build_header(f"📬 未回复消息", "orange"),
+        "body": {"elements": elements}
+    }
+
+
+def build_commands_card() -> dict:
+    """构建命令总览卡片
+
+    Returns:
+        飞书卡片 JSON
+    """
+    elements = []
+
+    # 会话管理
+    elements.append({
+        "tag": "markdown",
+        "content": "## 📁 会话管理\n\n"
+                   "• `/list` - 查看并连接会话\n"
+                   "• `/attach <会话名>` - 连接到指定会话\n"
+                   "• `/detach` - 断开当前会话\n"
+                   "• `/start <会话名> [路径]` - 启动新会话\n"
+                   "• `/kill <会话名>` - 终止会话\n"
+                   "• `/status` - 查看当前状态"
+    })
+
+    # 消息检测
+    elements.append({"tag": "hr"})
+    elements.append({
+        "tag": "markdown",
+        "content": "## 📬 消息检测\n\n"
+                   "• `/check-messages` - 检查未回复消息（30个群，约1分钟）\n"
+                   "• `/check-messages --all` - 全量检查（30个最活跃群，最近24小时）\n"
+                   "• `/messages-auto on|off [间隔]` - 开启/关闭自动检查\n"
+                   "• `/messages-config blacklist|priority add|remove|list [chat_id]` - 配置黑名单/重点群\n"
+                   "• `/messages-status` - 查看消息检查状态"
+    })
+
+    # OAuth 授权
+    elements.append({"tag": "hr"})
+    elements.append({
+        "tag": "markdown",
+        "content": "## 🔐 OAuth 授权\n\n"
+                   "• `/oauth` - 开始 OAuth 授权流程\n"
+                   "• `/oauth-status` - 查看授权状态\n"
+                   "• `/oauth-revoke` - 撤销授权"
+    })
+
+    # 配置管理
+    elements.append({"tag": "hr"})
+    elements.append({
+        "tag": "markdown",
+        "content": "## ⚙️ 配置管理\n\n"
+                   "• `/config` - 查看所有配置\n"
+                   "• `/config <key> <value>` - 修改配置项"
+    })
+
+    # 其他
+    elements.append({"tag": "hr"})
+    elements.append({
+        "tag": "markdown",
+        "content": "## 🔧 其他\n\n"
+                   "• `/ls [路径]` - 查看目录文件\n"
+                   "• `/tree [路径]` - 查看目录树\n"
+                   "• `/new-group <会话名>` - 创建专属群聊\n"
+                   "• `/help` - 查看帮助\n"
+                   "• `/menu` - 显示菜单"
+    })
+
+    return {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True},
+        "header": _build_header("📖 命令总览", "blue"),
+        "body": {"elements": elements}
+    }
+
+
+def build_config_card(config: dict) -> dict:
+    """构建配置管理卡片
+
+    Args:
+        config: 配置字典
+
+    Returns:
+        飞书卡片 JSON
+    """
+    elements = []
+
+    # @消息检测配置
+    mention_config = config.get("mention", {})
+    elements.append({
+        "tag": "markdown",
+        "content": "## 📬 @消息检测\n\n"
+                   f"• 自动检查: **{'开启' if mention_config.get('auto_check_enabled') else '关闭'}**\n"
+                   f"• 检查间隔: **{mention_config.get('check_interval_minutes', 10)} 分钟**\n"
+                   f"• 黑名单群数量: **{len(mention_config.get('blacklist_chats', []))}**\n"
+                   f"• 重点群数量: **{len(mention_config.get('priority_chats', []))}**\n"
+                   f"• 仅通知重点群: **{'是' if mention_config.get('notify_priority_only') else '否'}**"
+    })
+
+    # 通知配置
+    notification_config = config.get("notification", {})
+    elements.append({"tag": "hr"})
+    elements.append({
+        "tag": "markdown",
+        "content": "## 🔔 通知设置\n\n"
+                   f"• 任务完成提醒: **{'开启' if notification_config.get('on_complete') else '关闭'}**\n"
+                   f"• 错误提醒: **{'开启' if notification_config.get('on_error') else '关闭'}**\n"
+                   f"• 紧急@提醒: **{'开启' if notification_config.get('urgent_at_mention') else '关闭'}**"
+    })
+
+    # UI 配置
+    ui_config = config.get("ui", {})
+    elements.append({"tag": "hr"})
+    elements.append({
+        "tag": "markdown",
+        "content": "## 🎨 界面设置\n\n"
+                   f"• 消息模式: **{ui_config.get('message_mode', 'text')}**\n"
+                   f"• 跳过权限确认: **{'是' if ui_config.get('bypass_permission') else '否'}**"
+    })
+
+    # 修改提示
+    elements.append({"tag": "hr"})
+    elements.append({
+        "tag": "markdown",
+        "content": "💡 使用 `/config <key> <value>` 修改配置\n\n"
+                   "示例: `/config mention.check_interval_minutes 15`"
+    })
+
+    return {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True},
+        "header": _build_header("⚙️ 当前配置", "blue"),
+        "body": {"elements": elements}
+    }
+
+
+def build_mention_status_card(status: dict) -> dict:
+    """构建消息检查状态卡片（@消息和私聊）
+
+    Args:
+        status: 状态字典，包含 auto_enabled, interval, last_check, unreplied_count
+
+    Returns:
+        飞书卡片 JSON
+    """
+    elements = []
+
+    auto_enabled = status.get("auto_enabled", False)
+    interval = status.get("interval", 10)
+    last_check = status.get("last_check", "从未检查")
+    unreplied_count = status.get("unreplied_count", 0)
+
+    # 状态总览
+    status_text = "✅ 运行中" if auto_enabled else "⏸️ 已关闭"
+    elements.append({
+        "tag": "markdown",
+        "content": f"## 自动检查状态: {status_text}\n\n"
+                   f"（检测 @消息 和 私聊消息）\n\n"
+                   f"• 检查间隔: **{interval} 分钟**\n"
+                   f"• 上次检查: {last_check}\n"
+                   f"• 当前未回复: **{unreplied_count} 条**"
+    })
+
+    # 操作提示
+    elements.append({"tag": "hr"})
+    if auto_enabled:
+        elements.append({
+            "tag": "markdown",
+            "content": "💡 使用 `/messages-auto off` 关闭自动检查"
+        })
+    else:
+        elements.append({
+            "tag": "markdown",
+            "content": "💡 使用 `/messages-auto on [间隔]` 开启自动检查\n\n"
+                       "示例: `/messages-auto on 15` (每15分钟检查一次)"
+        })
+
+    return {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True},
+        "header": _build_header("📊 消息检查状态", "green" if auto_enabled else "grey"),
+        "body": {"elements": elements}
+    }
+
+
+def build_monitor_list_card(chats: List[dict]) -> dict:
+    """
+    构建监听列表卡片
+
+    Args:
+        chats: 监听的群聊列表，每项包含 chat_name, added_at 等字段
+
+    Returns:
+        dict: 飞书卡片 Schema 2.0 JSON
+    """
+    elements = []
+
+    if not chats:
+        elements.append({
+            "tag": "markdown",
+            "content": "📋 监听列表为空\n\n使用 `/monitor add` 在群聊中添加监听。"
+        })
+    else:
+        # 显示列表
+        for i, chat in enumerate(chats, 1):
+            import time
+            from datetime import datetime
+
+            chat_name = chat.get('chat_name', '未知群聊')
+            added_at = chat.get('added_at', 0)
+            added_time = datetime.fromtimestamp(added_at).strftime('%Y-%m-%d %H:%M')
+
+            elements.append({
+                "tag": "markdown",
+                "content": f"**{i}.** {chat_name}\n   添加于: {added_time}"
+            })
+
+        # 分隔线
+        elements.append({"tag": "hr"})
+
+        # 统计和提示
+        elements.append({
+            "tag": "markdown",
+            "content": f"共 **{len(chats)}** 个群聊\n\n"
+                       f"• 使用 `/monitor remove <序号>` 删除群聊\n"
+                       f"• 使用 `/monitor config` 配置推送设置"
+        })
+
+    return {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True},
+        "header": _build_header("📋 监听列表", "blue"),
+        "body": {"elements": elements}
+    }
+
+
+def build_summary_card(summary: dict, time_range: str = "") -> dict:
+    """
+    构建消息摘要卡片
+
+    Args:
+        summary: AI 分析结果，包含 summary 和 action_items
+        time_range: 时间范围字符串（如 "15:00-15:30"）
+
+    Returns:
+        dict: 飞书卡片 Schema 2.0 JSON
+    """
+    elements = []
+
+    # 总体描述
+    summary_text = summary.get('summary', '无')
+    elements.append({
+        "tag": "markdown",
+        "content": f"**总体情况**\n\n{summary_text}"
+    })
+
+    elements.append({"tag": "hr"})
+
+    # 待处理事项（按优先级分组）
+    action_items = summary.get('action_items', [])
+
+    if not action_items:
+        elements.append({
+            "tag": "markdown",
+            "content": "✅ 暂无需要处理的事项"
+        })
+    else:
+        # 按优先级分组
+        high_items = [item for item in action_items if item.get('priority') == 'high']
+        medium_items = [item for item in action_items if item.get('priority') == 'medium']
+        low_items = [item for item in action_items if item.get('priority') == 'low']
+
+        # 高优先级
+        if high_items:
+            elements.append({
+                "tag": "markdown",
+                "content": "### 🔴 高优先级\n\n" + "\n\n".join([
+                    f"**[{item.get('chat_name', '未知群聊')}]**\n"
+                    f"• {item.get('description', '无描述')}\n"
+                    f"💡 {item.get('suggestion', '无建议')}"
+                    for item in high_items
+                ])
+            })
+
+        # 中优先级
+        if medium_items:
+            elements.append({
+                "tag": "markdown",
+                "content": "### 🟡 中优先级\n\n" + "\n\n".join([
+                    f"**[{item.get('chat_name', '未知群聊')}]**\n"
+                    f"• {item.get('description', '无描述')}\n"
+                    f"💡 {item.get('suggestion', '无建议')}"
+                    for item in medium_items
+                ])
+            })
+
+        # 低优先级
+        if low_items:
+            elements.append({
+                "tag": "markdown",
+                "content": "### 🟢 低优先级\n\n" + "\n\n".join([
+                    f"**[{item.get('chat_name', '未知群聊')}]**\n"
+                    f"• {item.get('description', '无描述')}\n"
+                    f"💡 {item.get('suggestion', '无建议')}"
+                    for item in low_items
+                ])
+            })
+
+        # 统计
+        elements.append({"tag": "hr"})
+        total_messages = summary.get('total_messages', len(action_items))
+        elements.append({
+            "tag": "markdown",
+            "content": f"📊 共 **{len(action_items)}** 项待处理，来自 **{total_messages}** 条消息"
+        })
+
+    # 标题中包含时间范围
+    title = f"📊 消息摘要 ({time_range})" if time_range else "📊 消息摘要"
+
+    return {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True},
+        "header": _build_header(title, "orange"),
+        "body": {"elements": elements}
+    }
+
+
+def build_monitor_config_card(config: dict) -> dict:
+    """
+    构建监听配置卡片
+
+    Args:
+        config: 当前配置，包含 check_interval_minutes 和 quiet_hours
+
+    Returns:
+        dict: 飞书卡片 Schema 2.0 JSON
+    """
+    elements = []
+
+    # 当前配置概览
+    interval = config.get('check_interval_minutes', 10)
+    quiet_hours = config.get('quiet_hours', {})
+    quiet_enabled = quiet_hours.get('enabled', True)
+    quiet_start = quiet_hours.get('start', '22:00')
+    quiet_end = quiet_hours.get('end', '08:00')
+
+    elements.append({
+        "tag": "markdown",
+        "content": f"## 当前配置\n\n"
+                   f"• 检查频率: **{interval} 分钟**\n"
+                   f"• 静默时段: {'**已启用**' if quiet_enabled else '已关闭'}"
+    })
+
+    if quiet_enabled:
+        elements.append({
+            "tag": "markdown",
+            "content": f"• 静默时间: {quiet_start} - {quiet_end}"
+        })
+
+    elements.append({"tag": "hr"})
+
+    # 配置说明
+    elements.append({
+        "tag": "markdown",
+        "content": "## 配置说明\n\n"
+                   "**检查频率**: 系统每隔指定时间自动检查监听群聊的新消息\n\n"
+                   "**静默时段**: 在指定时间段内不推送消息摘要（避免打扰休息）\n\n"
+                   "💡 使用以下命令修改配置:\n\n"
+                   "• `/monitor config interval <分钟>` - 设置检查间隔（5/10/15/30）\n"
+                   "• `/monitor config quiet <开始时间> <结束时间>` - 设置静默时段（如 22:00 08:00）\n"
+                   "• `/monitor config quiet off` - 关闭静默时段"
+    })
+
+    return {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True},
+        "header": _build_header("⚙️ 监听配置", "green" if quiet_enabled else "grey"),
         "body": {"elements": elements}
     }

@@ -2,13 +2,17 @@
 __pycache__/
 *.py[cod]
 *.pyo
+*.egg
+*.egg-info/
+dist/
+build/
 .venv/
 venv/
-*.egg-info/
-test-results/
 
 # 环境配置（含密钥）
 .env
+.env.*
+!.env.example
 
 # 日志和临时文件
 *.log
@@ -22,9 +26,10 @@ test-results/
 *.sock
 *.pid
 *.status
-lark_client.log
+*.mq
 
 # 测试输出
+test-results/
 test_output/
 capture_*.txt
 
@@ -39,3 +44,26 @@ node_modules/
 
 # uv 锁文件（含内网 PyPI 地址，不提交）
 uv.lock
+
+# 本地工具链配置（含内网地址，不提交）
+.mcp.json
+.ttadk/
+
+# AI 工具与插件配置（不提交）
+.claude/commands/
+.claude/skills/
+.claude/hooks/
+ai-plugin.json
+specs/
+
+# Claude Code 本地配置
+.claude/settings.local.json
+.claude/settings.json
+
+# 备份目录
+backup_*/
+
+# AI 规划工具生成的临时文件
+docs/feishu-user-oauth/task_plan.md
+docs/feishu-user-oauth/progress.md
+docs/feishu-user-oauth/findings.md

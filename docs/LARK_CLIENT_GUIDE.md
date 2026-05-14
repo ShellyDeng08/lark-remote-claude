@@ -358,7 +358,7 @@ LARK_LOG_FILE=/custom/path/lark.log python3 remote_claude.py lark start
 如果遇到其他问题：
 
 1. 查看完整文档：[CLAUDE.md](./CLAUDE.md)
-2. 提交 Issue：[GitHub Issues](https://github.com/yourusername/remote_claude/issues)
+2. 提交 Issue：[GitHub Issues](https://github.com/ShellyDeng08/remote_claude/issues)
 3. 查看测试脚本：`test_lark_management.sh`
 
 ---

@@ -171,6 +171,73 @@ class SharedMemoryPoller:
         if ev:
             ev.set()
 
+    async def freeze_current_card(self, chat_id: str) -> bool:
+        """冻结当前活跃卡片（如果存在），用于新消息发送前创建新卡片
+
+        Returns:
+            bool: 是否成功冻结了卡片
+        """
+        logger.info(f"[freeze_current_card] 被调用, chat_id={chat_id[:8]}...")
+        tracker = self._trackers.get(chat_id)
+        if not tracker:
+            logger.info(f"[freeze_current_card] 无 tracker")
+            return False
+        if not tracker.cards:
+            logger.info(f"[freeze_current_card] 无 cards")
+            return False
+
+        # 找到未冻结的活跃卡片
+        active = None
+        for card in reversed(tracker.cards):
+            if not card.frozen:
+                active = card
+                break
+
+        if not active:
+            return False
+
+        # 读取当前共享内存内容
+        if not tracker.reader:
+            return False
+
+        try:
+            state = tracker.reader.read()
+        except Exception as e:
+            logger.warning(f"freeze_current_card: 读取共享内存失败: {e}")
+            return False
+
+        blocks = state.get("blocks", [])
+
+        # 如果没有内容，不需要冻结
+        if not blocks:
+            return False
+
+        # 获取当前卡片的 blocks 切片
+        blocks_slice = blocks[active.start_idx:]
+        if not blocks_slice:
+            return False
+
+        # 冻结卡片（移除状态区和按钮区）
+        from .card_builder import build_stream_card
+        frozen_card = build_stream_card(blocks_slice, None, None, is_frozen=True)
+        active.sequence += 1
+        success = await self._card_service.update_card(
+            active.card_id, active.sequence, frozen_card
+        )
+
+        if success:
+            active.frozen = True
+            # 重置 content_hash，让下一帧创建新卡片
+            tracker.content_hash = ""
+            logger.info(
+                f"[FREEZE for new message] session={tracker.session_name} "
+                f"card_id={active.card_id} blocks={len(blocks_slice)}"
+            )
+            return True
+        else:
+            logger.warning(f"freeze_current_card: 更新卡片失败 card_id={active.card_id}")
+            return False
+
     async def _poll_loop(self, chat_id: str) -> None:
         """轮询循环：支持 kick 唤醒 + 快速轮询模式"""
         while True:

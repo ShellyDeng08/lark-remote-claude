@@ -463,9 +463,9 @@ class TestBuildStreamCard(unittest.TestCase):
         card = build_stream_card(blocks)
         self.assertEqual(card["header"]["template"], "blue")
         elements = card["body"]["elements"]
-        # 应有按钮行（column_set，菜单已移入 form）
-        col_sets = [e for e in elements if e.get("tag") == "column_set"]
-        self.assertGreaterEqual(len(col_sets), 1)  # 至少 1 按钮行（菜单在 form 中）
+        # 应有选项文字列表（markdown 含编号选项）
+        option_mds = [e for e in elements if e.get("tag") == "markdown" and "**1.**" in e.get("content", "")]
+        self.assertGreaterEqual(len(option_mds), 1)
 
     def test_with_permission_buttons(self):
         """向后兼容：blocks 中的 PermissionBlock"""
@@ -492,8 +492,9 @@ class TestBuildStreamCard(unittest.TestCase):
         card = build_stream_card(blocks, option_block=ob)
         self.assertEqual(card["header"]["template"], "blue")
         elements = card["body"]["elements"]
-        col_sets = [e for e in elements if e.get("tag") == "column_set"]
-        self.assertGreaterEqual(len(col_sets), 2)  # 按钮行 + 菜单行
+        # 选项文字列表 + 菜单行
+        option_mds = [e for e in elements if e.get("tag") == "markdown" and "**1.**" in e.get("content", "")]
+        self.assertGreaterEqual(len(option_mds), 1)
 
     def test_with_permission_option_block_param(self):
         """option_block 参数：权限确认"""
@@ -547,18 +548,9 @@ class TestBuildStreamCard(unittest.TestCase):
         status_found = any("Processing" in e.get("content", "") for e in status_md)
         self.assertTrue(status_found)
 
-        # 第三层：按钮区（column_set with select_option）
-        button_sets = []
-        for e in elements:
-            if e.get("tag") == "column_set":
-                cols = e.get("columns", [])
-                for col in cols:
-                    for el in col.get("elements", []):
-                        behaviors = el.get("behaviors", [])
-                        for b in behaviors:
-                            if b.get("value", {}).get("action") == "select_option":
-                                button_sets.append(e)
-        self.assertGreaterEqual(len(button_sets), 1)
+        # 第三层：选项区（markdown 文字列表，替代 select_option 按钮）
+        option_mds = [e for e in elements if e.get("tag") == "markdown" and "**1.**" in e.get("content", "")]
+        self.assertGreaterEqual(len(option_mds), 1)
 
         # 第四层：菜单按钮（现在在 form > column_set 内）
         def _find_menu_open(column_set_elements):
