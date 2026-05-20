@@ -1,7 +1,7 @@
 {
   "name": "lark-remote-claude",
-  "version": "1.0.0",
-  "description": "Run Claude Code/Codex from Feishu (Lark) with shared terminal sessions and interactive cards.",
+  "version": "1.0.1",
+  "description": "Remote Claude Lark bridge: run Claude Code/Codex from Feishu (Lark) with shared terminal sessions and interactive cards.",
   "bin": {
     "remote-claude": "bin/remote-claude",
     "cla": "bin/cla",
@@ -46,11 +46,17 @@
   },
   "keywords": [
     "claude-code",
+    "claude-code-cli",
     "codex",
     "feishu",
+    "feishu-bot",
     "lark",
+    "lark-bot",
+    "remote-claude",
+    "lark-remote-claude",
     "terminal-sharing",
     "remote-terminal",
+    "shared-cli-session",
     "cli",
     "ai-coding",
     "pty"

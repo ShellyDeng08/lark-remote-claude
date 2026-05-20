@@ -285,7 +285,7 @@ remote-claude lark status
 ```
 
 ### 反馈问题
-GitHub Issues: https://github.com/ShellyDeng08/remote_claude/issues
+GitHub Issues: https://github.com/ShellyDeng08/lark-remote-claude/issues
 
 ---
 

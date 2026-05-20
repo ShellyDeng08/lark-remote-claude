@@ -4,6 +4,8 @@
 
 Feishu/Lark remote terminal bridge for Claude Code and Codex.
 
+Keywords: remote claude lark, lark remote claude, feishu claude code.
+
 ## 这个项目解决什么问题
 
 - 离开电脑时，仍可在手机飞书里继续操作同一个会话
@@ -28,8 +30,8 @@ npm install lark-remote-claude
 ### 方式 2：源码安装
 
 ```bash
-git clone https://github.com/ShellyDeng08/remote_claude.git
-cd remote_claude
+git clone https://github.com/ShellyDeng08/lark-remote-claude.git
+cd lark-remote-claude
 ./init.sh
 ```
 
@@ -178,7 +180,7 @@ OAUTH_SERVER_PORT=8080
 
 ## 关键词（便于搜索）
 
-Claude Code, Codex, Feishu bot, Lark bot, remote terminal, shared CLI session, AI coding assistant.
+Claude Code, Codex, Feishu bot, Lark bot, remote terminal, shared CLI session, AI coding assistant, remote-claude, lark-remote-claude.
 
 ## 文档
 
