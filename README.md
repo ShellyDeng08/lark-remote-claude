@@ -24,7 +24,7 @@ Keywords: remote claude lark, lark remote claude, feishu claude code.
 ### 方式 1：npm（推荐）
 
 ```bash
-npm install lark-remote-claude
+npm install -g lark-remote-claude
 ```
 
 ### 方式 2：源码安装
@@ -37,7 +37,31 @@ cd lark-remote-claude
 
 安装后请重启终端，使快捷命令生效。
 
-## 快速开始（只用终端）
+## 用户入口（先看这个）
+
+- 普通用户完整手册：
+  https://github.com/ShellyDeng08/lark-remote-claude/blob/main/docs/USER_GUIDE.md
+- 飞书客户端运维与排障：
+  https://github.com/ShellyDeng08/lark-remote-claude/blob/main/docs/LARK_CLIENT_GUIDE.md
+
+## 3 分钟快速开始（推荐）
+
+```bash
+# 1) 安装（全局）
+npm install -g lark-remote-claude
+
+# 2) 在你的项目目录启动（会自动启动飞书客户端）
+cl
+
+# 3) 若飞书侧无响应，执行一次重连
+remote-claude lark restart
+
+# 4) 在飞书里给机器人发 /menu，选择会话后直接开始聊天
+```
+
+> 说明：`remote-claude lark restart` 不需要每次都执行；首次安装后、修改飞书凭证后，或连接异常时执行一次即可。
+
+你也可以使用以下快捷命令：
 
 ```bash
 cla   # 启动 Claude（默认会话名为当前目录）
@@ -142,24 +166,48 @@ remote-claude lark stop
 
 ## 可选功能
 
-### 用户白名单（可选）
+### 自定义环境变量（`~/.remote-claude/.env`）
+
+除了 `FEISHU_APP_ID` / `FEISHU_APP_SECRET`，还支持以下常用自定义配置：
 
 ```bash
+# 用户白名单
 ENABLE_USER_WHITELIST=true
 ALLOWED_USERS=ou_xxx,ou_yyy
-```
 
-### 用户 OAuth（高级能力，可选）
+# 群聊名显示前缀
+GROUP_NAME_PREFIX=【Remote-Claude】
 
-仅当你需要“以用户身份访问更多飞书资源”时启用：
+# 自定义 Claude CLI 命令
+CLAUDE_COMMAND=claude
 
-```bash
+# 流式卡片单卡 block 上限
+MAX_CARD_BLOCKS=50
+
+# 日志级别
+LARK_LOG_LEVEL=INFO
+SERVER_LOG_LEVEL=INFO
+
+# SOCKS 代理环境下绕过飞书请求代理
+LARK_NO_PROXY=1
+
+# 用户 OAuth（高级能力）
 ENABLE_USER_AUTH=true
 OAUTH_SERVER_PORT=8080
 # OAUTH_REDIRECT_URI=http://localhost:8080/oauth/callback
+
+# 统计（可选）
+# MIXPANEL_TOKEN=your_mixpanel_token
+
+# AI 分析降级备用（可选）
+# ANTHROPIC_API_KEY=sk-ant-xxx
 ```
 
-详细见：`docs/feishu-user-oauth/USER_GUIDE.md`
+完整变量清单见仓库根目录 `.env.example`。
+
+### 用户 OAuth（高级能力，可选）
+
+仅当你需要“以用户身份访问更多飞书资源”时启用，详细见：`docs/feishu-user-oauth/USER_GUIDE.md`
 
 ## 常见问题
 

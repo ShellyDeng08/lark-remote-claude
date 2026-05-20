@@ -1099,7 +1099,8 @@ def build_help_card() -> Dict[str, Any]:
 
 **其他**
 • `/help` - 显示此帮助
-• `/menu` - 快捷操作面板"""
+• `/menu` - 快捷操作面板
+• 用户手册：<https://github.com/ShellyDeng08/lark-remote-claude/blob/main/docs/USER_GUIDE.md>"""
 
     return {
         "schema": "2.0",
