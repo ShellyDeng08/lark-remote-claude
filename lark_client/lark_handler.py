@@ -764,6 +764,15 @@ class LarkHandler:
 
         await self._cmd_attach(user_id, chat_id, session_name)
 
+    async def _show_unconnected_menu_entry(self, user_id: str, chat_id: str,
+                                           reason_text: Optional[str] = None):
+        """未连接会话时，主动给出菜单入口"""
+        await card_service.send_text(
+            chat_id,
+            reason_text or "未连接到任何会话，已为你打开能力菜单。"
+        )
+        await self._cmd_menu(user_id, chat_id)
+
     async def _cmd_help(self, user_id: str, chat_id: str,
                          message_id: Optional[str] = None):
         """显示帮助"""
@@ -1473,8 +1482,10 @@ class LarkHandler:
                     return
                 bridge = self._bridges.get(chat_id)
             else:
-                await card_service.send_text(
-                    chat_id, "未连接到任何会话，请先使用 /attach <会话名> 连接"
+                await self._show_unconnected_menu_entry(
+                    user_id,
+                    chat_id,
+                    reason_text="未连接到任何会话，已为你打开能力菜单。"
                 )
                 return
 
