@@ -157,16 +157,16 @@ class LarkHandler:
 
     def _kick_poller(self, chat_id: str) -> None:
         """触发立即轮询"""
-        if self._is_card_mode and self._poller:
-            self._kick_poller(chat_id)
+        if self._poller:
+            self._poller.kick(chat_id)
         elif self._text_poller:
             self._text_poller.kick(chat_id)
 
     def _read_snapshot(self, chat_id: str) -> Optional[dict]:
         """读取共享内存快照（兼容两种模式）"""
-        # 优先使用卡片的 poller（它维护了 reader 实例）
-        if self._is_card_mode and self._poller:
-            return self._read_snapshot(chat_id)
+        # 优先使用 poller（它维护了 reader 实例）
+        if self._poller:
+            return self._poller.read_snapshot(chat_id)
         # 文本模式：直接从共享内存读取
         session_name = self._chat_sessions.get(chat_id)
         if not session_name:
@@ -1292,14 +1292,58 @@ class LarkHandler:
     async def _cmd_new_group(self, user_id: str, chat_id: str, args: str,
                               message_id: Optional[str] = None):
         """创建专属群聊并绑定 Claude 会话"""
-        session_name = args.strip()
-        if not session_name:
-            await card_service.send_text(chat_id, "用法：/new-group <会话名>\n示例：/new-group myapp")
+        sessions = list_active_sessions()
+        if not sessions:
+            await card_service.send_text(chat_id, "当前没有可用会话，请先 /start 启动")
             return
 
-        sessions = list_active_sessions()
+        session_arg = args.strip()
+
+        def _render_session_choices(prefix: str = "") -> str:
+            home = str(Path.home())
+            lines = []
+            if prefix:
+                lines.append(prefix)
+                lines.append("")
+            lines.append("请选择要创建群聊的会话（ID=会话名）：")
+            for i, s in enumerate(sessions, 1):
+                name = s.get("name", "")
+                start_time = s.get("start_time", "")
+                cwd = (s.get("cwd", "") or "").replace(home, "~")
+                lines.append(f"{i}. `{name}`")
+                meta = []
+                if start_time:
+                    meta.append(f"启动：{start_time}")
+                if cwd:
+                    meta.append(cwd)
+                if meta:
+                    lines.append("   " + " ｜ ".join(meta))
+            lines.append("")
+            lines.append("用法：`/new-group <会话ID>` 或 `/new-group <序号>`")
+            return "\n".join(lines)
+
+        if not session_arg:
+            await card_service.send_text(chat_id, _render_session_choices())
+            return
+
+        # 支持序号选择，降低手输会话名出错概率
+        if session_arg.isdigit():
+            idx = int(session_arg)
+            if idx < 1 or idx > len(sessions):
+                await card_service.send_text(
+                    chat_id,
+                    _render_session_choices(f"序号 {idx} 超出范围"),
+                )
+                return
+            session_name = sessions[idx - 1].get("name", "")
+        else:
+            session_name = session_arg
+
         if not any(s["name"] == session_name for s in sessions):
-            await card_service.send_text(chat_id, f"会话 '{session_name}' 不存在，请先 /start 启动")
+            await card_service.send_text(
+                chat_id,
+                _render_session_choices(f"会话 '{session_name}' 不存在"),
+            )
             return
 
         session = next((s for s in sessions if s["name"] == session_name), None)

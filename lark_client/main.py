@@ -300,7 +300,14 @@ def handle_card_action(event: P2CardActionTrigger) -> P2CardActionTriggerRespons
             needs_input = action_value.get("needs_input", False)
             print(f"[Lark] 用户选择了选项: {option_value} (total={option_total}, needs_input={needs_input})")
             asyncio.create_task(handler.handle_option_select(user_id, chat_id, option_value, option_total, needs_input=needs_input))
-            return None
+
+            # 立即反馈，避免用户感觉“点击无响应”
+            toast = CallBackToast()
+            toast.type = "info"
+            toast.content = f"已选择 {option_value}，正在处理..."
+            response = P2CardActionTriggerResponse()
+            response.toast = toast
+            return response
 
         # 列表卡片：进入会话
         if action_type == "list_attach":

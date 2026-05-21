@@ -121,6 +121,24 @@ class TestClaudeParserSelectedValue(unittest.TestCase):
         self.assertIn('3', values)
         self.assertEqual(ob.selected_value, '2')
 
+    def test_needs_input_only_on_type_something(self):
+        """仅 Type something 选项应标记 needs_input=True，普通选项应为 False"""
+        screen, input_rows = self._make_input_screen([
+            '你更偏好哪种风格？',
+            '❯ 1. 简洁专业',
+            '2. 业务说服型',
+            '3. Type something',
+            '↑/↓ to navigate · Enter to select',
+        ])
+        overflow = []
+        ob = self.parser._parse_input_area(screen, input_rows, [], overflow)
+        self.assertIsNotNone(ob)
+
+        by_value = {opt['value']: opt for opt in ob.options}
+        self.assertFalse(by_value['1'].get('needs_input', False))
+        self.assertFalse(by_value['2'].get('needs_input', False))
+        self.assertTrue(by_value['3'].get('needs_input', False))
+
     def test_permission_selected_value(self):
         """_parse_permission_area：❯ 前缀选项应写入 selected_value"""
         screen = make_screen()

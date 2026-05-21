@@ -402,16 +402,50 @@ def _build_menu_button_only() -> Dict[str, Any]:
 
 
 def _build_buttons_v2(options: List[Dict[str, str]]) -> List[Dict[str, Any]]:
-    """Schema 2.0 选项区：文字列表 + 输入提示（替代按钮，统一手机/桌面交互）"""
+    """Schema 2.0 选项区：支持点击按钮 + 输入框编号两种交互"""
     elements = [{"tag": "hr"}]
-    # 选项列表（纯文本）
+
+    # 选项列表（文本兜底，便于复制/输入编号）
     lines = []
+    total = len(options)
     for i, opt in enumerate(options):
         label = opt.get("label", "")
         lines.append(f"**{i+1}.** {_escape_md(label)}")
     lines.append("")
-    lines.append("<font color=\"grey\">在输入框输入编号选择，或直接打字回复</font>")
+    lines.append("<font color=\"grey\">可直接点击选项，或在输入框输入编号选择</font>")
     elements.append({"tag": "markdown", "content": "\n".join(lines)})
+
+    # 可点击按钮（回调到 handle_card_action -> handle_option_select）
+    for i, opt in enumerate(options):
+        label = opt.get("label", f"选项 {i+1}")
+        value = opt.get("value", str(i + 1))
+        needs_input = bool(opt.get("needs_input", False))
+        elements.append({
+            "tag": "column_set",
+            "flex_mode": "none",
+            "background_style": "default",
+            "columns": [{
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "elements": [{
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": f"{i+1}. {label}"},
+                    "type": "default",
+                    "width": "fill",
+                    "behaviors": [{
+                        "type": "callback",
+                        "value": {
+                            "action": "select_option",
+                            "value": value,
+                            "needs_input": needs_input,
+                            "total": str(total),
+                        }
+                    }],
+                }],
+            }],
+        })
+
     return elements
 
 
@@ -792,24 +826,35 @@ def _build_session_list_elements(sessions: List[Dict], current_session: Optional
             header_text = "\n".join(lines)
 
             if is_current:
-                btn_label = "断开连接"
-                btn_type = "danger"
-                btn_action = "list_detach"
-            else:
-                btn_label = "进入会话"
-                btn_type = "primary"
-                btn_action = "list_attach"
-            # 右列：单个按钮
-            right_buttons = [
-                {
+                attach_btn = {
                     "tag": "button",
-                    "text": {"tag": "plain_text", "content": btn_label},
-                    "type": btn_type,
+                    "text": {"tag": "plain_text", "content": "断开连接"},
+                    "type": "danger",
                     "behaviors": [{"type": "callback", "value": {
-                        "action": btn_action, "session": name
+                        "action": "list_detach", "session": name
                     }}]
-                },
-            ]
+                }
+            else:
+                attach_btn = {
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "进入会话"},
+                    "type": "primary",
+                    "behaviors": [{"type": "callback", "value": {
+                        "action": "list_attach", "session": name
+                    }}]
+                }
+
+            group_btn = {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "创建群聊"},
+                "type": "default",
+                "behaviors": [{"type": "callback", "value": {
+                    "action": "list_new_group", "session": name
+                }}]
+            }
+
+            # 右列：会话按钮 + 创建群聊按钮（与会话管理交互一致）
+            right_buttons = [attach_btn, group_btn]
             elements.append({
                 "tag": "column_set",
                 "flex_mode": "none",

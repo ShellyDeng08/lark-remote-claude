@@ -258,38 +258,30 @@ def _get_row_text(screen: pyte.Screen, row: int) -> str:
     return ''.join(buf).rstrip()
 
 
-def _is_dim_fg(fg_color: str) -> bool:
-    """判断前景色是否为灰色/暗色（placeholder 风格）。"""
-    if not fg_color or fg_color == 'default':
+def _label_looks_free_input(label: str) -> bool:
+    """按文案识别“自由输入”选项（如 Type something / Other / 其他 / 自定义）。"""
+    if not label:
         return False
-    name = fg_color.lower().replace(' ', '').replace('-', '')
-    if name in ('brightblack', 'black'):  # bright_black = gray
+
+    normalized = re.sub(r'\s+', ' ', label).strip().lower().strip('.:：')
+
+    # 英文常见文案
+    if normalized.startswith('type something'):
         return True
-    if len(fg_color) == 6:
-        try:
-            r, g, b = int(fg_color[0:2], 16), int(fg_color[2:4], 16), int(fg_color[4:6], 16)
-            L = 0.2126 * r + 0.7152 * g + 0.0722 * b
-            # 灰色调（R≈G≈B）且非纯白 → inactive/placeholder 颜色（如 999999 亮度 153 > 128）
-            if max(r, g, b) - min(r, g, b) <= 30 and L < 230:
-                return True
-            # 非灰色但较暗
-            return L < 128
-        except ValueError:
-            pass
+    if normalized in {
+        'other',
+        'something else',
+        'custom',
+        'custom input',
+        'other (please specify)',
+    }:
+        return True
+
+    # 中文常见文案
+    if any(k in label for k in ('其他', '其它', '自定义', '补充说明', '自填')):
+        return True
+
     return False
-
-
-def _option_label_is_dim(screen: pyte.Screen, row: int) -> bool:
-    """检查选项行 label 部分前景色是否为暗色（自由输入 placeholder 风格）。"""
-    text = _get_row_text(screen, row)
-    m = re.match(r'^[\s❯]*\d+[.)]\s+', text)
-    if not m:
-        return False
-    col = m.end()
-    buf_row = screen.buffer[row]
-    if col not in buf_row or not buf_row[col].data.strip():
-        return False
-    return _is_dim_fg(buf_row[col].fg)
 
 
 def _get_col0(screen: pyte.Screen, row: int) -> str:
@@ -926,11 +918,13 @@ class ClaudeParser(BaseParser):
             if m:
                 if current_opt is not None:
                     options.append(current_opt)
+                _label = m.group(2).strip()
                 current_opt = {
-                    'label': m.group(2).strip(),
+                    'label': _label,
                     'value': m.group(1),
                     'description': '',
-                    'needs_input': _option_label_is_dim(screen, row),  # 自由输入选项检测
+                    # 仅按文案识别自由输入选项，避免颜色误判导致普通选项无法提交
+                    'needs_input': _label_looks_free_input(_label),
                 }
                 if line.startswith('❯'):
                     selected_value = m.group(1)
