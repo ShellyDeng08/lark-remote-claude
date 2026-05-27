@@ -16,7 +16,7 @@ Keywords: remote claude lark, lark remote claude, feishu claude code.
 
 > 建议每次发版都在这里按版本号追加“新增能力 / 关键修复”。
 
-### v1.0.2（当前）
+### v1.0.3（当前）
 
 **新增能力**
 - 飞书群聊会话恢复与接管链路：支持离线态感知、恢复原会话、接管其他会话。

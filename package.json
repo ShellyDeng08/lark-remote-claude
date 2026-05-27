@@ -1,6 +1,6 @@
 {
   "name": "lark-remote-claude",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Remote Claude Lark bridge: run Claude Code/Codex from Feishu (Lark) with shared terminal sessions and interactive cards.",
   "bin": {
     "remote-claude": "bin/remote-claude",
