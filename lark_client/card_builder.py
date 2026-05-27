@@ -212,11 +212,15 @@ def _safe_truncate(text: str, limit: int) -> str:
     return truncated.rstrip() + '\n\n*...（内容过长，仅显示部分）*'
 
 
-def _build_menu_button_row(session_name: Optional[str] = None, disconnected: bool = False) -> List[Dict[str, Any]]:
+def _build_menu_button_row(
+    session_name: Optional[str] = None,
+    disconnected: bool = False,
+    is_group: bool = False,
+) -> List[Dict[str, Any]]:
     """底部快捷菜单按钮行，用于流式卡片
 
     - 连接状态（session_name 有值, disconnected=False）:
-      返回 [form, collapsible]，form 包含：⚡菜单 + 🔌断开 + spacer + Enter↵，下方输入框；collapsible 包含快捷键
+      返回 [form, collapsible]；私聊含“🔌断开”，群聊不外露“断开”按钮
     - 断开状态（disconnected=True）:
       返回 [column_set: ⚡菜单 + 🔗重新连接]，无输入框/Enter/快捷键
     - 无 session_name：保持原逻辑（只有 ⚡菜单 + spacer + Enter↵）
@@ -231,6 +235,16 @@ def _build_menu_button_row(session_name: Optional[str] = None, disconnected: boo
                     "text": {"tag": "plain_text", "content": "⚡ 菜单"},
                     "type": "default",
                     "behaviors": [{"type": "callback", "value": {"action": "menu_open"}}]
+                }]
+            },
+            {
+                "tag": "column",
+                "width": "auto",
+                "elements": [{
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "🔍 查看本轮变更"},
+                    "type": "default",
+                    "behaviors": [{"type": "callback", "value": {"action": "view_round_diff"}}]
                 }]
             },
             {
@@ -266,13 +280,28 @@ def _build_menu_button_row(session_name: Optional[str] = None, disconnected: boo
                 "width": "auto",
                 "elements": [{
                     "tag": "button",
+                    "text": {"tag": "plain_text", "content": "🔍 查看本轮变更"},
+                    "type": "default",
+                    "behaviors": [{"type": "callback", "value": {"action": "view_round_diff"}}]
+                }]
+            },
+        ]
+
+        if not is_group:
+            menu_columns.append({
+                "tag": "column",
+                "width": "auto",
+                "elements": [{
+                    "tag": "button",
                     "text": {"tag": "plain_text", "content": "🔌 断开"},
                     "type": "danger",
                     "behaviors": [{"type": "callback", "value": {
                         "action": "stream_detach", "session": session_name
                     }}]
                 }]
-            },
+            })
+
+        menu_columns.extend([
             {
                 "tag": "column",
                 "width": "weighted",
@@ -290,7 +319,7 @@ def _build_menu_button_row(session_name: Optional[str] = None, disconnected: boo
                     "action_type": "form_submit",
                 }]
             },
-        ]
+        ])
     else:
         menu_columns = [
             {
@@ -301,6 +330,16 @@ def _build_menu_button_row(session_name: Optional[str] = None, disconnected: boo
                     "text": {"tag": "plain_text", "content": "⚡ 菜单"},
                     "type": "default",
                     "behaviors": [{"type": "callback", "value": {"action": "menu_open"}}]
+                }]
+            },
+            {
+                "tag": "column",
+                "width": "auto",
+                "elements": [{
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "🔍 查看本轮变更"},
+                    "type": "default",
+                    "behaviors": [{"type": "callback", "value": {"action": "view_round_diff"}}]
                 }]
             },
             {
@@ -384,20 +423,32 @@ def _build_menu_button_row(session_name: Optional[str] = None, disconnected: boo
 
 
 def _build_menu_button_only() -> Dict[str, Any]:
-    """底部菜单按钮行（仅 ⚡菜单 按钮），用于辅助卡片"""
+    """底部菜单按钮行（⚡菜单 + 🔍查看本轮变更），用于辅助卡片"""
     return {
         "tag": "column_set",
         "flex_mode": "none",
-        "columns": [{
-            "tag": "column",
-            "width": "auto",
-            "elements": [{
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": "⚡ 菜单"},
-                "type": "default",
-                "behaviors": [{"type": "callback", "value": {"action": "menu_open"}}]
-            }]
-        }],
+        "columns": [
+            {
+                "tag": "column",
+                "width": "auto",
+                "elements": [{
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "⚡ 菜单"},
+                    "type": "default",
+                    "behaviors": [{"type": "callback", "value": {"action": "menu_open"}}]
+                }]
+            },
+            {
+                "tag": "column",
+                "width": "auto",
+                "elements": [{
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "🔍 查看本轮变更"},
+                    "type": "default",
+                    "behaviors": [{"type": "callback", "value": {"action": "view_round_diff"}}]
+                }]
+            },
+        ],
     }
 
 
@@ -655,6 +706,7 @@ def build_stream_card(
     option_block: Optional[dict] = None,
     session_name: Optional[str] = None,
     disconnected: bool = False,
+    is_group: bool = False,
     cli_type: str = "claude",
 ) -> Dict[str, Any]:
     """从共享内存 blocks 流构建飞书卡片
@@ -763,7 +815,11 @@ def build_stream_card(
 
     # === 第四层：菜单按钮 ===
     elements.append({"tag": "hr"})
-    elements.extend(_build_menu_button_row(session_name=session_name, disconnected=disconnected))
+    elements.extend(_build_menu_button_row(
+        session_name=session_name,
+        disconnected=disconnected,
+        is_group=is_group,
+    ))
 
     _cb_logger.debug(
         f"build_stream_card: blocks={len(blocks)} frozen={is_frozen} "
@@ -844,14 +900,30 @@ def _build_session_list_elements(sessions: List[Dict], current_session: Optional
                     }}]
                 }
 
-            group_btn = {
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": "创建群聊"},
-                "type": "default",
-                "behaviors": [{"type": "callback", "value": {
-                    "action": "list_new_group", "session": name
-                }}]
-            }
+            matched_group_cid = None
+            if session_groups:
+                matched_group_cid = session_groups.get(name)
+
+            if matched_group_cid:
+                group_btn = {
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "进入群聊"},
+                    "type": "default",
+                    "behaviors": [{"type": "open_url",
+                                   "default_url": f"https://applink.feishu.cn/client/chat/open?openChatId={matched_group_cid}",
+                                   "android_url": f"https://applink.feishu.cn/client/chat/open?openChatId={matched_group_cid}",
+                                   "ios_url": f"https://applink.feishu.cn/client/chat/open?openChatId={matched_group_cid}",
+                                   "pc_url": f"https://applink.feishu.cn/client/chat/open?openChatId={matched_group_cid}"}]
+                }
+            else:
+                group_btn = {
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "创建群聊"},
+                    "type": "default",
+                    "behaviors": [{"type": "callback", "value": {
+                        "action": "list_new_group", "session": name
+                    }}]
+                }
 
             # 右列：会话按钮 + 创建群聊按钮（与会话管理交互一致）
             right_buttons = [attach_btn, group_btn]
@@ -920,16 +992,46 @@ def _build_session_list_elements(sessions: List[Dict], current_session: Optional
     return elements
 
 
-def build_status_card(connected: bool, session_name: Optional[str] = None) -> Dict[str, Any]:
+def build_status_card(connected: bool, session_name: Optional[str] = None, *, group_mode: bool = False) -> Dict[str, Any]:
     """构建状态卡片"""
     if connected and session_name:
         title = "🟢 已连接"
         template = "green"
         content = f"当前会话：**{session_name}**"
+        action_row = _build_menu_button_only()
     else:
         title = "⚪ 未连接"
         template = "grey"
-        content = "使用 `/attach <会话名>` 连接到 Claude 会话"
+        if group_mode:
+            content = "当前群未连接会话，请使用 `/menu` → `恢复会话` → `接管会话`"
+        else:
+            content = "请先执行 `/menu` 选择并连接会话（也可手动用 `/attach <会话名>`）"
+        action_row = {
+            "tag": "column_set",
+            "flex_mode": "none",
+            "columns": [
+                {
+                    "tag": "column",
+                    "width": "auto",
+                    "elements": [{
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "⚡ 菜单"},
+                        "type": "default",
+                        "behaviors": [{"type": "callback", "value": {"action": "menu_open"}}]
+                    }]
+                },
+                {
+                    "tag": "column",
+                    "width": "auto",
+                    "elements": [{
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "❓ 帮助"},
+                        "type": "default",
+                        "behaviors": [{"type": "callback", "value": {"action": "menu_help"}}]
+                    }]
+                },
+            ],
+        }
 
     return {
         "schema": "2.0",
@@ -938,7 +1040,7 @@ def build_status_card(connected: bool, session_name: Optional[str] = None) -> Di
         "body": {"elements": [
             {"tag": "markdown", "content": content},
             {"tag": "hr"},
-            _build_menu_button_only(),
+            action_row,
         ]}
     }
 
@@ -1121,21 +1223,40 @@ def build_help_card() -> Dict[str, Any]:
     """构建帮助卡片"""
     help_content = """**🚀 快速开始**
 • `/menu` - 弹出快捷操作面板（推荐入口）
+• `/cl <内容>` - 强制直通 Claude（用于输入 Claude 原生命令，如 `/cl /compact`、`/cl /clear`）
 
 **会话管理**
 • `/start <会话名> [工作路径]` - 启动新会话并自动连接
-• `/attach <会话名>` - 连接到已有会话
+• `/attach <会话名>` - 连接到已有会话（私聊/普通会话）
 • `/detach` - 断开当前会话
-• `/list` - 列出所有可用会话（带一键 Attach 按钮）
+• `/list` - 列出可用会话（带卡片按钮）
 • `/kill <会话名>` - 终止会话
 • `/status` - 显示当前连接状态
 
-**目录浏览**
+**目录与变更**
 • `/ls [路径]` - 查看文件列表
 • `/tree [路径]` - 查看目录树（2 层）
+• `/diff` - 查看当前 chat 绑定会话的工作区变更（未提交）
 
 **群聊协作**
-• `/new-group <会话名>` - 创建专属群聊，多人共用同一 Claude
+• `/new-group <会话名|序号>` - 创建专属群聊并绑定会话
+• `/summarize-now` - 在专属群手动触发一次滚动总结
+• 群内支持 `/attach <会话名>` 切换（会影响当前上下文，建议仅在原会话无法恢复时使用）
+• 更推荐在恢复卡中点击“接管会话”（更直观）
+
+**消息检测与配置**
+• `/check-messages`（别名 `/check-mentions`）- 立即检查未回复消息
+• `/messages-auto on|off [分钟]`（别名 `/mentions-auto`）
+• `/messages-config ...`（别名 `/mentions-config`）
+• `/messages-status`（别名 `/mentions-status`）
+• `/config [key] [value]` - 查看或更新配置
+
+**监听功能（monitor）**
+• `/monitor add|list|remove <序号>`
+• `/monitor config`
+• `/monitor config interval <分钟>`
+• `/monitor config quiet <开始> <结束>`
+• `/monitor config quiet off`
 
 **用户授权**
 • `/oauth` - 获取授权链接（以个人身份使用飞书 API）
@@ -1143,8 +1264,8 @@ def build_help_card() -> Dict[str, Any]:
 • `/oauth-revoke` - 撤销授权
 
 **其他**
+• `/commands` - 显示命令总览卡片
 • `/help` - 显示此帮助
-• `/menu` - 快捷操作面板
 • 用户手册：<https://github.com/ShellyDeng08/lark-remote-claude/blob/main/docs/USER_GUIDE.md>"""
 
     return {
@@ -1200,6 +1321,10 @@ def build_session_closed_card(session_name: str) -> Dict[str, Any]:
 
 def build_menu_card(sessions: List[Dict], current_session: Optional[str] = None,
                     session_groups: Optional[Dict[str, str]] = None, page: int = 0,
+                    notify_enabled: bool = False,
+                    urgent_enabled: bool = False,
+                    bypass_enabled: bool = False,
+                    show_preferences: bool = True,
                     **_kwargs) -> Dict[str, Any]:
     """构建菜单卡片（/menu 和 /list 共用）：会话列表 + 功能按钮"""
     elements = []
@@ -1276,11 +1401,402 @@ def build_menu_card(sessions: List[Dict], current_session: Optional[str] = None,
         ]
     })
 
+    if show_preferences:
+        # 第三行：偏好开关（仅卡片模式生效）
+        elements.append({
+            "tag": "column_set",
+            "flex_mode": "none",
+            "columns": [
+                {
+                    "tag": "column",
+                    "width": "weighted",
+                    "weight": 1,
+                    "elements": [{
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": f"🔔 完成提醒 {'开' if notify_enabled else '关'}"},
+                        "type": "default",
+                        "width": "fill",
+                        "behaviors": [{"type": "callback", "value": {"action": "menu_toggle_notify"}}]
+                    }]
+                },
+                {
+                    "tag": "column",
+                    "width": "weighted",
+                    "weight": 1,
+                    "elements": [{
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": f"🚨 紧急提醒 {'开' if urgent_enabled else '关'}"},
+                        "type": "default",
+                        "width": "fill",
+                        "behaviors": [{"type": "callback", "value": {"action": "menu_toggle_urgent"}}]
+                    }]
+                },
+            ]
+        })
+
+        elements.append({
+            "tag": "column_set",
+            "flex_mode": "none",
+            "columns": [
+                {
+                    "tag": "column",
+                    "width": "weighted",
+                    "weight": 1,
+                    "elements": [{
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": f"⚙️ 跳过确认 {'开' if bypass_enabled else '关'}"},
+                        "type": "default",
+                        "width": "fill",
+                        "behaviors": [{"type": "callback", "value": {"action": "menu_toggle_bypass"}}]
+                    }]
+                },
+                {
+                    "tag": "column",
+                    "width": "weighted",
+                    "weight": 1,
+                    "elements": [{"tag": "markdown", "content": " "}]
+                },
+            ]
+        })
+
     return {
         "schema": "2.0",
         "config": {"wide_screen_mode": True},
         "header": _build_header("⚡ 菜单", "turquoise"),
         "body": {"elements": elements}
+    }
+
+
+def _is_unrecoverable_offline_reason(reason: str) -> bool:
+    """离线原因是否表示原会话不可恢复（仅能接管）"""
+    text = (reason or "").strip()
+    if not text:
+        return False
+    lower = text.lower()
+    return any(k in text for k in ["已终止", "不存在", "已退出"]) or any(
+        k in lower for k in ["terminated", "not found", "exited"]
+    )
+
+
+def build_group_menu_card(session_name: Optional[str], *, connected: bool = False,
+                          status: str = "",
+                          reason: str = "") -> Dict[str, Any]:
+    """构建专属群聊精简菜单：仅展示当前绑定会话相关操作"""
+    elements: List[Dict[str, Any]] = []
+
+    session_text = _escape_md(session_name or "未绑定")
+    st = (status or ("active" if connected else "offline")).strip()
+    if st == "active":
+        status_text = "在线"
+        status_color = "green"
+    elif st == "suspect_offline":
+        status_text = "检测中"
+        status_color = "yellow"
+    else:
+        status_text = "离线"
+        status_color = "orange"
+
+    reason_md = f"\n<font color=\"grey\">原因：{_escape_md(reason)}</font>" if reason else ""
+    elements.append({
+        "tag": "markdown",
+        "content": (
+            f"**当前绑定会话：** `{session_text}`\n"
+            f"<font color=\"{status_color}\">状态：{status_text}</font>{reason_md}\n"
+            "<font color=\"grey\">可在群内切换会话，但会影响当前上下文，建议优先恢复原会话。</font>"
+        ),
+    })
+    elements.append({"tag": "hr"})
+
+    elements.append({
+        "tag": "column_set",
+        "flex_mode": "none",
+        "columns": [
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "elements": [{
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "📊 当前状态"},
+                    "type": "default",
+                    "width": "fill",
+                    "behaviors": [{"type": "callback", "value": {"action": "menu_status"}}],
+                }],
+            },
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "elements": [{
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "📂 文件列表"},
+                    "type": "default",
+                    "width": "fill",
+                    "behaviors": [{"type": "callback", "value": {"action": "menu_ls"}}],
+                }],
+            },
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "elements": [{
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "🌲 目录树"},
+                    "type": "default",
+                    "width": "fill",
+                    "behaviors": [{"type": "callback", "value": {"action": "menu_tree"}}],
+                }],
+            },
+        ],
+    })
+
+    if connected:
+        recover_text = "⚡ 刷新菜单"
+        recover_type = "default"
+        recover_action = "menu_open"
+        recover_disabled = False
+    elif st == "suspect_offline":
+        recover_text = "⏳ 检测中"
+        recover_type = "default"
+        recover_action = "menu_open"
+        recover_disabled = False
+    else:
+        if _is_unrecoverable_offline_reason(reason):
+            recover_text = "📋 接管会话"
+            recover_type = "primary"
+            recover_action = "group_choose_takeover"
+            recover_disabled = False
+        else:
+            recover_text = "🔗 恢复会话"
+            recover_type = "primary"
+            recover_action = "group_show_recovery"
+            recover_disabled = False
+
+    elements.append({
+        "tag": "column_set",
+        "flex_mode": "none",
+        "columns": [
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "elements": [{
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "❓ 帮助"},
+                    "type": "default",
+                    "width": "fill",
+                    "behaviors": [{"type": "callback", "value": {"action": "menu_help"}}],
+                }],
+            },
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "elements": [{
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": recover_text},
+                    "type": recover_type,
+                    "width": "fill",
+                    "behaviors": [{"type": "callback", "value": {"action": recover_action}}],
+                    **({"disabled": True} if recover_disabled else {}),
+                }],
+            },
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "elements": [{
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "📝 立即总结"},
+                    "type": "default",
+                    "width": "fill",
+                    "behaviors": [{"type": "callback", "value": {"action": "group_summarize_now"}}],
+                    **({"disabled": True} if not connected else {}),
+                }],
+            },
+        ],
+    })
+
+    elements.append({
+        "tag": "column_set",
+        "flex_mode": "none",
+        "columns": [
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "elements": [{
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "🔍 查看本轮变更"},
+                    "type": "default",
+                    "width": "fill",
+                    "behaviors": [{"type": "callback", "value": {"action": "view_round_diff"}}],
+                }],
+            },
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 2,
+                "elements": [{"tag": "markdown", "content": " "}],
+            },
+        ],
+    })
+
+    elements.append({
+        "tag": "column_set",
+        "flex_mode": "none",
+        "columns": [
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "elements": [{
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "🗑 解散群聊"},
+                    "type": "danger",
+                    "width": "fill",
+                    "behaviors": [{"type": "callback", "value": {
+                        "action": "list_disband_group",
+                        "session": session_name or "",
+                    }}],
+                    **({"disabled": True} if not session_name else {}),
+                }],
+            },
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 2,
+                "elements": [{"tag": "markdown", "content": " "}],
+            },
+        ],
+    })
+
+    return {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True},
+        "header": _build_header("⚡ 群聊菜单", "turquoise"),
+        "body": {"elements": elements},
+    }
+
+
+def build_group_recovery_card(
+    session_name: Optional[str],
+    *,
+    reason: str = "",
+    sessions: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """构建群聊离线恢复卡片"""
+    session_text = _escape_md(session_name or "未绑定")
+    raw_reason = reason.strip() if reason else ""
+    reason_text = _escape_md(raw_reason) if raw_reason else "会话连接已断开，请选择恢复方式。"
+    unrecoverable = _is_unrecoverable_offline_reason(raw_reason)
+    elements: List[Dict[str, Any]] = [
+        {
+            "tag": "markdown",
+            "content": (
+                f"**当前绑定会话：** `{session_text}`\n"
+                f"<font color=\"orange\">状态：离线</font>\n"
+                f"<font color=\"grey\">原因：{reason_text}</font>"
+            ),
+        },
+        {"tag": "hr"},
+        {
+            "tag": "column_set",
+            "flex_mode": "none",
+            "columns": [
+                {
+                    "tag": "column",
+                    "width": "weighted",
+                    "weight": 1,
+                    "elements": [{
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": ("📋 接管其他会话" if unrecoverable else "🔌 重连原会话")},
+                        "type": "primary",
+                        "width": "fill",
+                        "behaviors": [{"type": "callback", "value": {
+                            "action": ("group_choose_takeover" if unrecoverable else "group_reconnect_original")
+                        }}],
+                        **({"disabled": True} if (not session_name and not unrecoverable) else {}),
+                    }],
+                },
+                {
+                    "tag": "column",
+                    "width": "weighted",
+                    "weight": 1,
+                    "elements": [{
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "📋 选择现有会话接管"},
+                        "type": "default",
+                        "width": "fill",
+                        "behaviors": [{"type": "callback", "value": {"action": "group_choose_takeover"}}],
+                    }],
+                },
+            ],
+        },
+    ]
+
+    if sessions is not None:
+        elements.append({"tag": "hr"})
+        if not sessions:
+            elements.append({
+                "tag": "markdown",
+                "content": "当前没有可用会话。请先在私聊使用 `/start <会话名>` 创建会话，再回到本群接管。",
+            })
+        else:
+            elements.append({"tag": "markdown", "content": "**可接管会话**"})
+            for s in sessions[:8]:
+                name = s.get("name", "")
+                if not name:
+                    continue
+                cwd = _escape_md((s.get("cwd") or "").replace(_pl.Path.home().as_posix(), "~"))
+                time_text = _escape_md(s.get("start_time") or "")
+                line = f"`{_escape_md(name)}`"
+                details = []
+                if time_text:
+                    details.append(f"启动：{time_text}")
+                if cwd:
+                    details.append(cwd)
+                if details:
+                    line += "\n<font color=\"grey\">" + " ｜ ".join(details) + "</font>"
+                elements.append({
+                    "tag": "column_set",
+                    "flex_mode": "none",
+                    "columns": [
+                        {
+                            "tag": "column",
+                            "width": "weighted",
+                            "weight": 3,
+                            "elements": [{"tag": "markdown", "content": line}],
+                        },
+                        {
+                            "tag": "column",
+                            "width": "weighted",
+                            "weight": 1,
+                            "elements": [{
+                                "tag": "button",
+                                "text": {"tag": "plain_text", "content": "接管"},
+                                "type": "primary",
+                                "width": "fill",
+                                "behaviors": [{"type": "callback", "value": {
+                                    "action": "group_takeover_session",
+                                    "session": name,
+                                }}],
+                            }],
+                        },
+                    ],
+                })
+                elements.append({"tag": "hr"})
+            if elements and elements[-1].get("tag") == "hr":
+                elements.pop()
+
+    elements.append({"tag": "hr"})
+    elements.append(_build_menu_button_only())
+
+    return {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True},
+        "header": _build_header("🟠 会话离线（可恢复）", "orange"),
+        "body": {"elements": elements},
     }
 
 
@@ -1380,6 +1896,9 @@ def build_mentions_card(mentions: List) -> dict:
                 "content": f"还有 {len(sorted_mentions) - 10} 条消息未显示..."
             })
 
+    elements.append({"tag": "hr"})
+    elements.append(_build_menu_button_only())
+
     return {
         "schema": "2.0",
         "config": {"wide_screen_mode": True},
@@ -1447,9 +1966,13 @@ def build_commands_card() -> dict:
                    "• `/ls [路径]` - 查看目录文件\n"
                    "• `/tree [路径]` - 查看目录树\n"
                    "• `/new-group <会话名>` - 创建专属群聊\n"
+                   "• `/summarize-now` - 专属群手动触发滚动总结\n"
                    "• `/help` - 查看帮助\n"
                    "• `/menu` - 显示菜单"
     })
+
+    elements.append({"tag": "hr"})
+    elements.append(_build_menu_button_only())
 
     return {
         "schema": "2.0",
@@ -1511,6 +2034,9 @@ def build_config_card(config: dict) -> dict:
                    "示例: `/config mention.check_interval_minutes 15`"
     })
 
+    elements.append({"tag": "hr"})
+    elements.append(_build_menu_button_only())
+
     return {
         "schema": "2.0",
         "config": {"wide_screen_mode": True},
@@ -1559,6 +2085,9 @@ def build_mention_status_card(status: dict) -> dict:
             "content": "💡 使用 `/messages-auto on [间隔]` 开启自动检查\n\n"
                        "示例: `/messages-auto on 15` (每15分钟检查一次)"
         })
+
+    elements.append({"tag": "hr"})
+    elements.append(_build_menu_button_only())
 
     return {
         "schema": "2.0",
@@ -1610,6 +2139,9 @@ def build_monitor_list_card(chats: List[dict]) -> dict:
                        f"• 使用 `/monitor remove <序号>` 删除群聊\n"
                        f"• 使用 `/monitor config` 配置推送设置"
         })
+
+    elements.append({"tag": "hr"})
+    elements.append(_build_menu_button_only())
 
     return {
         "schema": "2.0",
@@ -1702,6 +2234,9 @@ def build_summary_card(summary: dict, time_range: str = "") -> dict:
     # 标题中包含时间范围
     title = f"📊 消息摘要 ({time_range})" if time_range else "📊 消息摘要"
 
+    elements.append({"tag": "hr"})
+    elements.append(_build_menu_button_only())
+
     return {
         "schema": "2.0",
         "config": {"wide_screen_mode": True},
@@ -1755,6 +2290,9 @@ def build_monitor_config_card(config: dict) -> dict:
                    "• `/monitor config quiet <开始时间> <结束时间>` - 设置静默时段（如 22:00 08:00）\n"
                    "• `/monitor config quiet off` - 关闭静默时段"
     })
+
+    elements.append({"tag": "hr"})
+    elements.append(_build_menu_button_only())
 
     return {
         "schema": "2.0",

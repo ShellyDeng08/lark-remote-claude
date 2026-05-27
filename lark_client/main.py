@@ -69,13 +69,14 @@ _setup_logging()
 
 import lark_oapi as lark
 
-from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
+from lark_oapi.api.im.v1 import P2ImMessageReceiveV1, P2ImChatMemberBotAddedV1
 from lark_oapi.event.callback.model.p2_card_action_trigger import (
     P2CardActionTrigger, P2CardActionTriggerResponse, CallBackToast
 )
 
 from . import config
 from .lark_handler import handler
+from .card_service import card_service
 
 
 async def _graceful_shutdown() -> None:
@@ -134,6 +135,84 @@ def _record_dm_chat(user_id: str, chat_id: str) -> None:
             print(f"[DM] 记录私聊: {user_id[:8]}... -> {chat_id[:8]}...")
     except Exception as e:
         print(f"[DM] 记录私聊失败: {e}")
+
+
+def _collect_post_text(node) -> str:
+    """递归提取 post 富文本中的可见文本。"""
+    if isinstance(node, str):
+        return node
+
+    if isinstance(node, list):
+        parts = [(_collect_post_text(item) or "").strip() for item in node]
+        return "\n".join([p for p in parts if p]).strip()
+
+    if not isinstance(node, dict):
+        return ""
+
+    tag = node.get("tag")
+    if tag == "at":
+        name = node.get("name") or node.get("user_name") or ""
+        if name:
+            return f"@{name}"
+
+    # 常见字段优先
+    direct_parts = []
+    for key in ("text", "content", "title", "name"):
+        val = node.get(key)
+        if isinstance(val, str) and val.strip():
+            direct_parts.append(val.strip())
+
+    nested_parts = []
+    for key, val in node.items():
+        if key in ("text", "title", "name", "tag"):
+            continue
+        # 过滤结构化标识字段，避免把 image_key/open_id 之类机器字段当用户文本
+        if key.endswith("_key") or key in ("id", "open_id", "union_id", "user_id", "chat_id", "message_id"):
+            continue
+        got = (_collect_post_text(val) or "").strip()
+        if got:
+            nested_parts.append(got)
+
+    merged = "\n".join([p for p in (direct_parts + nested_parts) if p]).strip()
+    return merged
+
+
+def _extract_message_text(message_type: str, content_raw: str) -> str:
+    """统一提取飞书消息文本内容（text / post）。"""
+    try:
+        content = json.loads(content_raw)
+    except Exception:
+        return ""
+
+    if message_type == "text":
+        return (content.get("text", "") or "").strip()
+
+    if message_type == "post":
+        # 优先从 locale payload 中提取
+        locale_payload = None
+        for v in content.values():
+            if isinstance(v, dict) and "content" in v:
+                locale_payload = v
+                break
+
+        if isinstance(locale_payload, dict):
+            lines = []
+            title = (locale_payload.get("title") or "").strip()
+            if title:
+                lines.append(title)
+
+            body = _collect_post_text(locale_payload.get("content") or [])
+            if body:
+                lines.append(body)
+
+            merged = "\n".join([ln for ln in lines if ln]).strip()
+            if merged:
+                return merged
+
+        # 兜底：直接递归整个 JSON
+        return _collect_post_text(content).strip()
+
+    return ""
 
 
 def handle_message_receive(data: P2ImMessageReceiveV1) -> None:
@@ -222,14 +301,12 @@ def handle_message_receive(data: P2ImMessageReceiveV1) -> None:
                 asyncio.create_task(_handle_image_message(handler, user_id, chat_id, message_id, image_key))
             return
 
-        # 只处理文本消息
-        if message_type != "text":
+        # text / post 都尝试提取文本；其余类型继续忽略
+        if message_type not in ("text", "post"):
             print(f"[Lark] 忽略非文本消息: {message_type}")
             return
 
-        # 解析消息内容
-        content = json.loads(message.content)
-        text = content.get("text", "").strip()
+        text = _extract_message_text(message_type, message.content)
 
         # 移除 @ 提及
         if message.mentions:
@@ -238,6 +315,21 @@ def handle_message_receive(data: P2ImMessageReceiveV1) -> None:
                 text = text.replace(mention.key, "").strip()
 
         if not text:
+            if chat_type != "p2p":
+                # 仅在 text + @ 场景下才视作“只@无文本”入口
+                if message_type == "text" and message.mentions:
+                    asyncio.create_task(handler.handle_message(user_id, chat_id, "", chat_type=chat_type))
+                else:
+                    print(
+                        f"[Lark] 文本提取为空: type={message_type}, chat={chat_id[:8]}..., "
+                        f"content={message.content[:120]!r}"
+                    )
+                    asyncio.create_task(
+                        card_service.send_text(
+                            chat_id,
+                            "⚠️ 未识别到可解析文本，请直接发送纯文本消息后重试。"
+                        )
+                    )
             return
 
         print(f"[Lark] 收到消息: {user_id[:8]}... -> {text[:50]}...")
@@ -249,6 +341,81 @@ def handle_message_receive(data: P2ImMessageReceiveV1) -> None:
         print(f"[Lark] 处理消息异常: {e}")
         import traceback
         traceback.print_exc()
+
+
+def handle_chat_member_bot_added(data: P2ImChatMemberBotAddedV1) -> None:
+    """机器人被拉入群时主动推送入口卡片（仅专属群）。"""
+    try:
+        event = data.event
+        chat_id = event.chat_id
+        operator_id = event.operator_id.open_id if event.operator_id else ""
+        if not chat_id:
+            return
+
+        print(f"[Lark] bot added event: chat={chat_id[:8]}..., operator={operator_id[:8] if operator_id else 'N/A'}...")
+        asyncio.create_task(handler._show_group_entry_card(operator_id or "system", chat_id))
+    except Exception as e:
+        print(f"[Lark] 处理 bot added 事件异常: {e}")
+
+
+_ACTION_HINTS = {
+    "list_attach": "执行指令：/attach",
+    "list_detach": "执行指令：/detach",
+    "list_new_group": "执行指令：/new-group",
+    "list_disband_group": "执行指令：/disband-group",
+    "list_kill": "执行指令：/kill",
+    "dir_browse": "执行指令：/ls",
+    "menu_page": "执行指令：/menu",
+    "dir_page": "执行指令：/ls",
+    "dir_start": "执行指令：/start",
+    "dir_new_group": "执行指令：/start + /new-group",
+    "menu_detach": "执行指令：/detach",
+    "menu_list": "执行指令：/list",
+    "menu_help": "执行指令：/help",
+    "menu_ls": "执行指令：/ls",
+    "menu_tree": "执行指令：/tree",
+    "menu_status": "执行指令：/status",
+    "stream_detach": "执行指令：/detach",
+    "stream_reconnect": "执行指令：/attach",
+    "send_key": "执行指令：快捷键",
+    "menu_toggle_notify": "执行指令：notify 开关",
+    "menu_toggle_urgent": "执行指令：urgent 开关",
+    "menu_toggle_bypass": "执行指令：bypass 开关",
+    "group_show_recovery": "执行指令：恢复会话",
+    "group_reconnect_original": "执行指令：恢复原会话",
+    "group_choose_takeover": "执行指令：选择接管会话",
+    "group_takeover_session": "执行指令：接管会话",
+    "group_summarize_now": "执行指令：/summarize-now",
+    "view_round_diff": "执行指令：/diff",
+    "menu_open": "执行指令：/menu",
+    "select_option": "执行指令：选择选项",
+}
+
+
+async def _visualize_action(chat_id: str, action_type: str, action_value: dict) -> None:
+    try:
+        hint = _ACTION_HINTS.get(action_type, f"执行动作：{action_type}")
+        extra = ""
+        if action_type in ("list_attach", "list_new_group", "list_disband_group", "list_kill", "group_takeover_session", "stream_reconnect", "stream_detach"):
+            session = str((action_value or {}).get("session", "") or "").strip()
+            if session:
+                extra = f" `{session}`"
+        elif action_type in ("dir_browse", "dir_page"):
+            path = str((action_value or {}).get("path", "") or "").strip()
+            if path:
+                extra = f" `{path}`"
+        elif action_type == "send_key":
+            key = str((action_value or {}).get("key", "") or "").strip()
+            if key:
+                extra = f" `{key}`"
+        elif action_type == "select_option":
+            val = str((action_value or {}).get("value", "") or "").strip()
+            if val:
+                extra = f" `{val}`"
+
+        await card_service.send_text(chat_id, f"✅ {hint}{extra}")
+    except Exception as e:
+        print(f"[Lark] 可视化动作提示发送失败: {e}")
 
 
 def handle_card_action(event: P2CardActionTrigger) -> P2CardActionTriggerResponse:
@@ -292,6 +459,8 @@ def handle_card_action(event: P2CardActionTrigger) -> P2CardActionTriggerRespons
             return None
 
         action_type = action_value.get("action", "")
+        if action_type:
+            asyncio.create_task(_visualize_action(chat_id, action_type, action_value))
 
         # 处理选项选择动作
         if action_type == "select_option":
@@ -403,7 +572,7 @@ def handle_card_action(event: P2CardActionTrigger) -> P2CardActionTriggerRespons
             return None
 
         if action_type == "menu_status":
-            asyncio.create_task(handler._cmd_status(user_id, chat_id))
+            asyncio.create_task(handler._cmd_status(user_id, chat_id, message_id=message_id))
             return None
 
         # 流式卡片：断开连接
@@ -442,6 +611,32 @@ def handle_card_action(event: P2CardActionTrigger) -> P2CardActionTriggerRespons
 
         if action_type == "menu_toggle_bypass":
             asyncio.create_task(handler._cmd_toggle_bypass(user_id, chat_id, message_id=message_id))
+            return None
+
+        # 群聊离线恢复入口
+        if action_type == "group_show_recovery":
+            asyncio.create_task(handler._cmd_group_show_recovery(user_id, chat_id, message_id=message_id))
+            return None
+
+        if action_type == "group_reconnect_original":
+            asyncio.create_task(handler._cmd_group_reconnect_original(user_id, chat_id, message_id=message_id))
+            return None
+
+        if action_type == "group_choose_takeover":
+            asyncio.create_task(handler._cmd_group_choose_takeover(user_id, chat_id, message_id=message_id))
+            return None
+
+        if action_type == "group_takeover_session":
+            session_name = action_value.get("session", "")
+            asyncio.create_task(handler._cmd_group_takeover_session(user_id, chat_id, session_name, message_id=message_id))
+            return None
+
+        if action_type == "group_summarize_now":
+            asyncio.create_task(handler._cmd_summarize_now(user_id, chat_id, message_id=message_id))
+            return None
+
+        if action_type == "view_round_diff":
+            asyncio.create_task(handler._cmd_view_round_diff(user_id, chat_id, message_id=message_id))
             return None
 
         # 各卡片底部菜单按钮：辅助卡片就地→菜单，流式卡片降级新卡
@@ -676,6 +871,7 @@ class LarkBot:
         # 创建事件处理器
         event_handler = lark.EventDispatcherHandler.builder("", "") \
             .register_p2_im_message_receive_v1(handle_message_receive) \
+            .register_p2_im_chat_member_bot_added_v1(handle_chat_member_bot_added) \
             .register_p2_card_action_trigger(handle_card_action) \
             .build()
 

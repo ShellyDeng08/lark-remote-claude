@@ -9,12 +9,15 @@
 """
 
 import asyncio
+import difflib
 import json
 import logging
 import os as _os
+import re
 import subprocess
 import sys
 import time
+import uuid
 from datetime import datetime as _datetime
 from pathlib import Path
 from typing import Optional, Dict, Any, List
@@ -29,10 +32,13 @@ from .card_builder import (
     build_help_card,
     build_dir_card,
     build_menu_card,
+    build_group_menu_card,
+    build_group_recovery_card,
     build_monitor_list_card,
     build_summary_card,
     build_monitor_config_card,
     _build_header,
+    _build_menu_button_only,
 )
 from .shared_memory_poller import SharedMemoryPoller, CardSlice
 from .text_message_poller import TextMessagePoller, _build_pending_card
@@ -40,7 +46,6 @@ from .monitor_config import MonitorConfigService
 
 # 消息模式: "card" (卡片模式) 或 "text" (文本模式)
 # 可以通过环境变量 LARK_MESSAGE_MODE 设置
-import os as _os
 MESSAGE_MODE = _os.environ.get("LARK_MESSAGE_MODE", "text").lower()  # 默认使用文本模式
 
 # 飞书机器人菜单中文名称 → 命令映射（菜单类型选"发送文字消息"，名称填左列）
@@ -84,6 +89,7 @@ class LarkHandler:
     _CHAT_BINDINGS_FILE = get_chat_bindings_file()
     _OLD_CHAT_BINDINGS_FILE = Path("/tmp/remote-claude/lark_chat_bindings.json")
     _LARK_GROUP_IDS_FILE = Path(get_chat_bindings_file()).parent / "lark_group_ids.json"
+    _LARK_GROUP_META_FILE = Path(get_chat_bindings_file()).parent / "lark_group_meta.json"
 
     def __init__(self):
         # 兼容迁移：旧绑定文件存在而新路径不存在时，自动迁移
@@ -111,6 +117,10 @@ class LarkHandler:
         self._chat_bindings: Dict[str, str] = self._load_chat_bindings()
         # 专属群聊 chat_id 集合（仅包含通过 /new-group 创建的群）
         self._group_chat_ids: set = self._load_group_chat_ids()
+        # 专属群聊元信息：chat_id -> {session_name, status, updated_at, retain}
+        self._group_meta: Dict[str, Dict[str, Any]] = self._load_group_meta()
+        self._sync_group_meta()
+        self._cleanup_offline_groups()
         # chat_id → CardSlice（用户主动断开后保留，供重连时冻结旧卡片）- 仅卡片模式使用
         self._detached_slices: Dict[str, CardSlice] = {}
         # OAuth 服务实例（由 main.py 的 LarkBot._init_oauth 注入，未启用时为 None）
@@ -121,6 +131,18 @@ class LarkHandler:
         self.monitor_config = MonitorConfigService()
         # User API 实例（由 main.py 注入，用于读取群聊信息）
         self.user_api = None
+        # 群聊离线探测任务（chat_id -> task），用于 suspect_offline -> offline 防抖
+        self._group_offline_probe_tasks: Dict[str, asyncio.Task] = {}
+        # 群聊恢复锁（chat_id 级 single-flight）
+        self._group_recovery_locks: Dict[str, asyncio.Lock] = {}
+        # 群聊恢复进行态与最近结果（chat_id -> {request_id, result}）
+        self._group_recovery_inflight: Dict[str, Dict[str, Any]] = {}
+        self._group_recovery_last_result: Dict[str, Dict[str, Any]] = {}
+        # 群聊总结锁（chat_id 级 single-flight）
+        self._group_summary_locks: Dict[str, asyncio.Lock] = {}
+        # 每个 chat 的“本轮对话变更”基线（进入会话时记录）
+        # chat_id -> {session_name, repo_root, merge_base, baseline_head, baseline_status, baseline_diff}
+        self._round_diff_baseline: Dict[str, Dict[str, Any]] = {}
 
     @property
     def _is_card_mode(self) -> bool:
@@ -184,6 +206,41 @@ class LarkHandler:
             logger.warning(f"读取共享内存失败: {e}")
             return None
 
+    @staticmethod
+    def _count_user_input_blocks(snapshot: Optional[dict]) -> int:
+        if not isinstance(snapshot, dict):
+            return -1
+        blocks = snapshot.get('blocks') or []
+        return sum(1 for b in blocks if isinstance(b, dict) and b.get('_type') == 'UserInput')
+
+    async def _wait_user_input_reflected(self, chat_id: str, before_count: int,
+                                         timeout_seconds: float = 2.0,
+                                         interval_seconds: float = 0.2) -> bool:
+        """等待本次输入在快照中出现（UserInput 数量增加）。"""
+        if before_count < 0:
+            return True
+        deadline = time.time() + max(0.2, timeout_seconds)
+        while time.time() < deadline:
+            await asyncio.sleep(max(0.05, interval_seconds))
+            snap = self._read_snapshot(chat_id)
+            if self._count_user_input_blocks(snap) > before_count:
+                return True
+        return False
+
+    async def _verify_group_recovery_ready(self, chat_id: str, session_name: str,
+                                           *, timeout_seconds: float = 2.2,
+                                           interval_seconds: float = 0.15) -> bool:
+        """恢复后健康校验：bridge/session 映射稳定，且共享内存可读。"""
+        deadline = time.time() + max(0.6, timeout_seconds)
+        while time.time() < deadline:
+            bridge = self._bridges.get(chat_id)
+            if bridge and bridge.running and self._chat_sessions.get(chat_id) == session_name:
+                snapshot = self._read_snapshot(chat_id)
+                if isinstance(snapshot, dict):
+                    return True
+            await asyncio.sleep(max(0.05, interval_seconds))
+        return False
+
     # ── 持久化绑定 ──────────────────────────────────────────────────────────
 
     def _load_chat_bindings(self) -> Dict[str, str]:
@@ -220,6 +277,601 @@ class LarkHandler:
         except Exception as e:
             logger.warning(f"保存群聊 ID 失败: {e}")
 
+    def _load_group_meta(self) -> Dict[str, Dict[str, Any]]:
+        try:
+            if self._LARK_GROUP_META_FILE.exists():
+                data = json.loads(self._LARK_GROUP_META_FILE.read_text())
+                if isinstance(data, dict):
+                    return data
+        except Exception as e:
+            logger.warning(f"读取群聊元信息失败: {e}")
+        return {}
+
+    def _save_group_meta(self):
+        try:
+            ensure_user_data_dir()
+            self._LARK_GROUP_META_FILE.write_text(
+                json.dumps(self._group_meta, ensure_ascii=False)
+            )
+        except Exception as e:
+            logger.warning(f"保存群聊元信息失败: {e}")
+
+    def _set_group_status(self, chat_id: str, session_name: str, status: str, *,
+                          retain: Optional[bool] = None,
+                          reason: Optional[str] = None):
+        now = int(time.time())
+        meta = self._group_meta.get(chat_id, {})
+        meta['session_name'] = session_name
+        meta['status'] = status
+        meta['updated_at'] = now
+        if retain is not None:
+            meta['retain'] = bool(retain)
+        elif 'retain' not in meta:
+            meta['retain'] = False
+        if reason is not None:
+            meta['reason'] = reason
+        elif status == 'active':
+            meta.pop('reason', None)
+        self._group_meta[chat_id] = meta
+        self._save_group_meta()
+
+    def _sync_group_meta(self):
+        changed = False
+        for cid in list(self._group_meta.keys()):
+            if cid not in self._group_chat_ids:
+                self._group_meta.pop(cid, None)
+                changed = True
+
+        for cid in self._group_chat_ids:
+            sname = self._chat_bindings.get(cid, '')
+            meta = self._group_meta.get(cid)
+            if not meta:
+                self._group_meta[cid] = {
+                    'session_name': sname,
+                    'status': 'active' if cid in self._chat_sessions else 'offline',
+                    'updated_at': int(time.time()),
+                    'retain': False,
+                }
+                changed = True
+                continue
+            if sname and meta.get('session_name') != sname:
+                meta['session_name'] = sname
+                changed = True
+            if 'retain' not in meta:
+                meta['retain'] = False
+                changed = True
+            if 'updated_at' not in meta:
+                meta['updated_at'] = int(time.time())
+                changed = True
+            if 'status' not in meta:
+                meta['status'] = 'active' if cid in self._chat_sessions else 'offline'
+                changed = True
+            if meta.get('status') == 'active' and 'reason' in meta:
+                meta.pop('reason', None)
+                changed = True
+
+        if changed:
+            self._save_group_meta()
+
+    def _cleanup_offline_groups(self, retention_days: int = 7):
+        """清理超期离线群元数据（仅清理本地元数据，不调用飞书解散）。"""
+        cutoff = int(time.time()) - retention_days * 86400
+        removed = 0
+
+        for cid, meta in list(self._group_meta.items()):
+            if meta.get('retain', False):
+                continue
+            if meta.get('status') != 'offline':
+                continue
+            updated_at = int(meta.get('updated_at', 0) or 0)
+            if updated_at <= 0 or updated_at >= cutoff:
+                continue
+
+            self._group_meta.pop(cid, None)
+            self._group_chat_ids.discard(cid)
+            self._chat_bindings.pop(cid, None)
+            self._bridges.pop(cid, None)
+            self._chat_sessions.pop(cid, None)
+            self._detached_slices.pop(cid, None)
+            removed += 1
+
+        if removed:
+            logger.info(f"已清理超期离线群元数据: {removed} 个")
+            self._save_group_meta()
+            self._save_group_chat_ids()
+            self._save_chat_bindings()
+
+    def _remove_group_meta(self, chat_id: str):
+        if chat_id in self._group_meta:
+            self._group_meta.pop(chat_id, None)
+            self._save_group_meta()
+
+    def _get_group_meta(self, chat_id: str) -> Dict[str, Any]:
+        return self._group_meta.get(chat_id, {})
+
+    def _get_group_offline_reason(self, chat_id: str) -> str:
+        meta = self._group_meta.get(chat_id, {})
+        return str(meta.get('reason', '') or '').strip()
+
+    def _set_group_last_summary(self, chat_id: str, summary_text: str, *,
+                                seq: Optional[int] = None,
+                                block_cursor: Optional[int] = None,
+                                filtered_count: Optional[int] = None):
+        meta = self._group_meta.get(chat_id, {})
+        meta['last_summary'] = summary_text
+        if seq is not None:
+            meta['summary_seq'] = int(seq)
+        if block_cursor is not None:
+            meta['summary_block_cursor'] = int(block_cursor)
+        if filtered_count is not None:
+            meta['summary_filtered_count'] = int(filtered_count)
+        meta['updated_at'] = int(time.time())
+        self._group_meta[chat_id] = meta
+        self._save_group_meta()
+
+    def _get_group_last_summary(self, chat_id: str) -> str:
+        meta = self._group_meta.get(chat_id, {})
+        return str(meta.get('last_summary', '') or '').strip()
+
+    def _get_group_summary_seq(self, chat_id: str) -> int:
+        meta = self._group_meta.get(chat_id, {})
+        return int(meta.get('summary_seq', 0) or 0)
+
+    def _get_group_summary_filtered_count(self, chat_id: str) -> int:
+        meta = self._group_meta.get(chat_id, {})
+        return int(meta.get('summary_filtered_count', 0) or 0)
+
+    def _ensure_group_recovery_lock(self, chat_id: str) -> asyncio.Lock:
+        lock = self._group_recovery_locks.get(chat_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._group_recovery_locks[chat_id] = lock
+        return lock
+
+    def _ensure_group_summary_lock(self, chat_id: str) -> asyncio.Lock:
+        lock = self._group_summary_locks.get(chat_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._group_summary_locks[chat_id] = lock
+        return lock
+
+    def _is_summary_block(self, content: str) -> bool:
+        text = (content or "").strip()
+        return text.startswith("[RC-SUMMARY")
+
+    def _is_recovery_context_block(self, content: str) -> bool:
+        text = (content or "").strip()
+        return text.startswith("[RECOVERY_CONTEXT v1]")
+
+    def _is_summary_prompt_block(self, content: str) -> bool:
+        text = (content or "").strip()
+        return text.startswith("[RC-SUMMARY-PROMPT v1]")
+
+    def _get_block_text(self, block: Dict[str, Any]) -> str:
+        t = block.get('_type', '')
+        if t == 'UserInput':
+            return str(block.get('text', '') or '')
+        return str(block.get('content', '') or '')
+
+    def _is_recovery_ack_block(self, content: str) -> bool:
+        text = (content or '').strip()
+        if not text:
+            return False
+        hints = [
+            "恢复回放",
+            "恢复上下文",
+            "不是新的用户请求",
+            "不是新指令",
+            "不会重复执行历史步骤",
+            "当前状态保持不变",
+        ]
+        hit = sum(1 for h in hints if h in text)
+        return hit >= 2
+
+    def _is_system_noise_block(self, block: Dict[str, Any]) -> bool:
+        t = block.get('_type', '')
+        if t == 'SystemBlock':
+            return True
+        if t == 'OutputBlock':
+            txt = str(block.get('content', '') or '')
+            if 'menu_open' in txt and 'action' in txt:
+                return True
+            if self._is_recovery_context_block(txt):
+                return True
+            if self._is_recovery_ack_block(txt):
+                return True
+        if t == 'UserInput':
+            txt = str(block.get('text', '') or '')
+            if self._is_summary_prompt_block(txt):
+                return True
+            if self._is_recovery_context_block(txt):
+                return True
+        return False
+
+    def _normalize_recovery_text(self, text: str, *, max_len: int = 4000) -> str:
+        s = (text or '').strip()
+        if not s:
+            return ''
+        if len(s) <= max_len:
+            return s
+        head = s[:500]
+        tail = s[-500:]
+        return head + "\n[truncated]\n" + tail
+
+    def _extract_user_speaker(self, text: str) -> str:
+        # 兼容 parser 产出的前缀："[张三|ou_xxx] xxx"
+        m = re.match(r'^\[(.+?)\]\s*(.*)$', (text or '').strip(), flags=re.S)
+        if m:
+            return m.group(1)
+        return ''
+
+    def _build_recovery_messages_from_blocks(self, blocks: List[Dict[str, Any]], *,
+                                             max_messages: int = 120,
+                                             total_budget: int = 16000) -> List[Dict[str, str]]:
+        msgs: List[Dict[str, str]] = []
+        budget = 0
+
+        # 从后往前取，最后再 reverse，保证近期优先
+        for b in reversed(blocks):
+            t = b.get('_type', '')
+            if self._is_system_noise_block(b):
+                continue
+
+            raw = ''
+            role = ''
+            if t == 'UserInput':
+                role = 'user'
+                raw = self._get_block_text(b)
+                speaker = self._extract_user_speaker(raw)
+                if speaker:
+                    raw = f"[{speaker}] " + re.sub(r'^\[(.+?)\]\s*', '', raw)
+            elif t in ('OutputBlock', 'PlanBlock'):
+                role = 'assistant'
+                raw = self._get_block_text(b)
+                if self._is_summary_block(raw) or self._is_recovery_context_block(raw):
+                    continue
+            elif t == 'SystemBlock':
+                role = 'system'
+                raw = self._get_block_text(b)
+            else:
+                continue
+
+            raw = self._normalize_recovery_text(raw)
+            if not raw:
+                continue
+
+            add_cost = len(raw)
+            if budget + add_cost > total_budget:
+                continue
+
+            msgs.append({'role': role, 'content': raw})
+            budget += add_cost
+            if len(msgs) >= max_messages:
+                break
+
+        msgs.reverse()
+        return msgs
+
+    def _build_recovery_context_package(self, chat_id: str, snapshot: Dict[str, Any]) -> str:
+        blocks = list(snapshot.get('blocks', []) or [])
+
+        # 定位最近 summary，优先取其后的增量
+        last_summary_idx = -1
+        last_summary_text = ''
+        for i in range(len(blocks) - 1, -1, -1):
+            b = blocks[i]
+            if b.get('_type') == 'OutputBlock':
+                content = str(b.get('content', '') or '')
+                if self._is_summary_block(content):
+                    last_summary_idx = i
+                    last_summary_text = self._normalize_recovery_text(content, max_len=4000)
+                    break
+
+        if not last_summary_text:
+            last_summary_text = self._get_group_last_summary(chat_id)
+
+        if last_summary_idx >= 0:
+            candidate_blocks = blocks[last_summary_idx + 1:]
+        else:
+            candidate_blocks = blocks[-80:]
+
+        msgs = self._build_recovery_messages_from_blocks(candidate_blocks)
+
+        lines = [
+            "[RECOVERY_CONTEXT v1]",
+            "这是历史回放，不是新的用户请求；请不要重复执行历史步骤。",
+            "",
+            "checkpoint:",
+            last_summary_text or "<none>",
+            "",
+            "messages:",
+        ]
+        for m in msgs:
+            lines.append(f"- role={m['role']}: {m['content']}")
+
+        lines.extend([
+            "",
+            "请从“最后一条 user 意图”继续执行，并先用 3-5 条要点确认你的理解。",
+        ])
+        return "\n".join(lines)
+
+    async def _inject_recovery_context(self, chat_id: str) -> bool:
+        bridge = self._bridges.get(chat_id)
+        if not bridge or not bridge.running:
+            return False
+
+        snapshot = self._read_snapshot(chat_id)
+        if not snapshot:
+            return False
+
+        payload = self._build_recovery_context_package(chat_id, snapshot)
+        if not payload.strip():
+            return False
+
+        ok = await bridge.send_input(payload)
+        if ok:
+            self._kick_poller(chat_id)
+        return bool(ok)
+
+    @staticmethod
+    def _count_bullets(text: str) -> int:
+        return sum(1 for ln in (text or "").splitlines() if ln.strip().startswith("- "))
+
+    def _extract_summary_block_from_output(self, content: str, seq: int) -> str:
+        marker = f"[RC-SUMMARY v1 #{seq}]"
+        text = (content or "").strip()
+        idx = text.find(marker)
+        if idx < 0:
+            return ""
+        tail = text[idx:]
+        return self._normalize_recovery_text(tail, max_len=5000)
+
+    def _build_ai_summary_prompt(self, *, seq: int, trigger_text: str, delta: int,
+                                 msgs: List[Dict[str, str]]) -> str:
+        lines = [
+            "[RC-SUMMARY-PROMPT v1]",
+            "你是群聊会话恢复助手，请根据给定历史生成结构化滚动总结。",
+            "仅输出最终总结块，不要输出解释、前言、代码块。",
+            "",
+            f"固定要求：首行必须是 [RC-SUMMARY v1 #{seq}]",
+            f"固定要求：触发方式必须是 `{trigger_text}`",
+            f"固定要求：触发依据必须包含“新增有效消息约 {delta} 条（阈值 80）”",
+            "",
+            "history:",
+        ]
+        for m in msgs[-30:]:
+            role = m.get('role', 'user')
+            content = self._truncate_text(str(m.get('content', '')).replace("\n", " "), 220)
+            lines.append(f"- role={role}: {content}")
+
+        lines.extend([
+            "",
+            "请严格输出以下 10 行结构，不要增删字段：",
+            f"[RC-SUMMARY v1 #{seq}]",
+            f"- 触发方式：{trigger_text}",
+            "- 目标与范围：<一句话，15-30字>",
+            "- 最近用户意图：<一句话，包含具体动作/需求>",
+            "- 最近助手进展：<一句话，包含已完成动作>",
+            "- 已完成：<一句话，用“约N条”表达>",
+            "- 当前状态：<一句话>",
+            "- 未决问题：<一句话，包含待处理项>",
+            f"- 触发依据：自上次总结后新增有效消息约 {delta} 条（阈值 80）",
+            "- 关键约束：群聊恢复为近似恢复，不保证原进程内存级一致",
+            "- 下一步：从最后一条 user 意图继续执行",
+        ])
+        return "\n".join(lines)
+
+    def _build_fallback_summary_text(self, *, seq: int, trigger_text: str, delta: int,
+                                     done: int, todo: int, user_focus: str, assistant_focus: str) -> str:
+        return "\n".join([
+            f"[RC-SUMMARY v1 #{seq}]",
+            f"- 触发方式：{trigger_text}",
+            "- 目标与范围：基于最近会话记录自动提炼",
+            f"- 最近用户意图：{user_focus}",
+            f"- 最近助手进展：{assistant_focus}",
+            f"- 已完成：近段 assistant 输出约 {done} 条",
+            "- 当前状态：会话可继续推进",
+            f"- 未决问题：待处理 user 输入约 {todo} 条",
+            f"- 触发依据：自上次总结后新增有效消息约 {delta} 条（阈值 80）",
+            "- 关键约束：群聊恢复为近似恢复，不保证原进程内存级一致",
+            "- 下一步：从最后一条 user 意图继续执行",
+        ])
+
+    async def _wait_ai_group_summary(self, chat_id: str, *, seq: int,
+                                     start_ts: float, timeout_seconds: float = 22.0) -> str:
+        deadline = time.time() + timeout_seconds
+        candidate = ""
+
+        while time.time() < deadline:
+            snapshot = self._read_snapshot(chat_id)
+            blocks = list((snapshot or {}).get('blocks', []) or [])
+            for b in reversed(blocks):
+                if b.get('_type') != 'OutputBlock':
+                    continue
+                b_ts = float(b.get('timestamp', 0) or 0)
+                if b_ts and b_ts < start_ts:
+                    continue
+                content = str(b.get('content', '') or '')
+                summary = self._extract_summary_block_from_output(content, seq)
+                if not summary:
+                    continue
+                if self._count_bullets(summary) >= 9:
+                    return summary
+                candidate = summary
+
+            await asyncio.sleep(0.6)
+
+        return candidate
+
+    async def _emit_group_summary(self, chat_id: str, *, force: bool = False,
+                                  trigger: str = "auto") -> bool:
+        """按 80 条滚动总结（群内写回）。force=True 时忽略阈值。"""
+        if chat_id not in self._group_chat_ids:
+            return False
+        if chat_id in self._group_recovery_inflight:
+            # 恢复流程进行中，避免窗口竞争
+            return False
+
+        lock = self._ensure_group_summary_lock(chat_id)
+        if lock.locked():
+            return False
+
+        async with lock:
+            snapshot = self._read_snapshot(chat_id)
+            if not snapshot:
+                return False
+
+            blocks = list(snapshot.get('blocks', []) or [])
+
+            # 全量过滤一次，结合本地游标判断“自上次总结以来是否新增 >=80 条”
+            filtered_all: List[Dict[str, Any]] = []
+            scanned_seq = 1
+            for b in blocks:
+                if self._is_system_noise_block(b):
+                    continue
+                if b.get('_type') == 'OutputBlock':
+                    content = str(b.get('content', '') or '')
+                    if self._is_summary_block(content):
+                        scanned_seq += 1
+                        continue
+                    if self._is_recovery_context_block(content):
+                        continue
+                filtered_all.append(b)
+
+            current_filtered_total = len(filtered_all)
+            prev_filtered_total = self._get_group_summary_filtered_count(chat_id)
+            if current_filtered_total < prev_filtered_total:
+                # 共享窗口重置/历史裁剪后，防止阈值基线失真
+                prev_filtered_total = current_filtered_total
+            if not force and current_filtered_total < prev_filtered_total + 80:
+                return False
+
+            meta_seq = self._get_group_summary_seq(chat_id)
+            if meta_seq <= 0 and self._get_group_last_summary(chat_id):
+                meta_seq = 1
+            seq = max(scanned_seq, meta_seq + 1)
+
+            recent = filtered_all[-80:] if current_filtered_total > 80 else filtered_all
+            msgs = self._build_recovery_messages_from_blocks(recent, max_messages=30, total_budget=6000)
+            done = sum(1 for m in msgs if m['role'] == 'assistant')
+            todo = sum(1 for m in msgs if m['role'] == 'user')
+            last_user = next((m['content'] for m in reversed(msgs) if m['role'] == 'user'), "")
+            last_assistant = next((m['content'] for m in reversed(msgs) if m['role'] == 'assistant'), "")
+            user_focus = self._truncate_text((last_user or "（暂无）").replace("\n", " "), 140)
+            assistant_focus = self._truncate_text((last_assistant or "（暂无）").replace("\n", " "), 140)
+
+            delta = max(0, current_filtered_total - prev_filtered_total)
+            trigger_text = f"手动触发（/summarize-now）" if trigger == "manual" else "自动触发（新增消息达到阈值）"
+            fallback_summary_text = self._build_fallback_summary_text(
+                seq=seq,
+                trigger_text=trigger_text,
+                delta=delta,
+                done=done,
+                todo=todo,
+                user_focus=user_focus,
+                assistant_focus=assistant_focus,
+            )
+
+            bridge = self._bridges.get(chat_id)
+            if not bridge or not bridge.running:
+                return False
+
+            summary_text = fallback_summary_text
+            send_input = getattr(bridge, 'send_input', None)
+            if callable(send_input):
+                prompt = self._build_ai_summary_prompt(
+                    seq=seq,
+                    trigger_text=trigger_text,
+                    delta=delta,
+                    msgs=msgs,
+                )
+                ask_ts = time.time()
+                ok = await send_input(prompt)
+                if ok:
+                    self._kick_poller(chat_id)
+                    ai_summary = await self._wait_ai_group_summary(chat_id, seq=seq, start_ts=ask_ts)
+                    if ai_summary:
+                        required_trigger = f"- 触发方式：{trigger_text}"
+                        required_basis = f"- 触发依据：自上次总结后新增有效消息约 {delta} 条（阈值 80）"
+                        if required_trigger in ai_summary and required_basis in ai_summary:
+                            summary_text = ai_summary
+                        else:
+                            logger.warning(f"AI 总结格式缺失关键行，回退模板: chat={chat_id[:8]}...")
+                    else:
+                        logger.warning(f"等待 AI 总结超时，回退模板: chat={chat_id[:8]}...")
+
+            msg_id = await card_service.send_text(chat_id, summary_text)
+            if msg_id:
+                self._set_group_last_summary(
+                    chat_id,
+                    summary_text,
+                    seq=seq,
+                    block_cursor=len(blocks),
+                    filtered_count=current_filtered_total,
+                )
+            return bool(msg_id)
+
+    async def _maybe_emit_group_summary_after_delay(self, chat_id: str, delay_seconds: float = 1.2):
+        """用户消息发出后延迟尝试自动总结（best effort）。"""
+        try:
+            await asyncio.sleep(max(0.5, delay_seconds))
+            await self._emit_group_summary(chat_id, force=False, trigger="auto")
+        except Exception as e:
+            logger.debug(f"自动总结尝试失败: chat={chat_id[:8]}... err={e}")
+
+    async def _probe_group_offline(self, chat_id: str, session_name: str, user_id: Optional[str],
+                                   *, reason: str = "", debounce_seconds: float = 3.5):
+        """离线防抖探测：suspect_offline -> offline。"""
+        try:
+            await asyncio.sleep(max(1.0, debounce_seconds))
+
+            # 群已解绑或会话已切走，直接结束
+            bound = self._chat_bindings.get(chat_id) or self._chat_sessions.get(chat_id)
+            if not bound or bound != session_name:
+                return
+
+            # 如果已经连上则恢复 active
+            bridge = self._bridges.get(chat_id)
+            if bridge and bridge.running:
+                self._set_group_status(chat_id, session_name, 'active')
+                return
+
+            # 尝试一次快速 attach，避免瞬时误判
+            ok = await self._attach(chat_id, session_name, user_id=user_id)
+            if ok:
+                self._chat_bindings[chat_id] = session_name
+                self._save_chat_bindings()
+                self._set_group_status(chat_id, session_name, 'active')
+                return
+
+            # 连续失败 -> offline，并推恢复卡片
+            offline_reason = reason or f"会话 {session_name} 当前不可连接"
+            self._set_group_status(chat_id, session_name, 'offline', reason=offline_reason)
+            card = build_group_recovery_card(session_name, reason=offline_reason)
+            await card_service.create_and_send_card(chat_id, card)
+        except Exception as e:
+            logger.warning(f"群聊离线探测失败: chat={chat_id[:8]}... err={e}")
+        finally:
+            self._group_offline_probe_tasks.pop(chat_id, None)
+
+    def _schedule_group_offline_probe(self, chat_id: str, session_name: str,
+                                      user_id: Optional[str] = None, *, reason: str = ""):
+        """为群聊启动离线防抖探测任务（同群仅保留最新一次）。"""
+        old = self._group_offline_probe_tasks.pop(chat_id, None)
+        if old and not old.done():
+            old.cancel()
+
+        self._set_group_status(chat_id, session_name, 'suspect_offline', reason=reason or "连接不稳定，正在探测")
+        task = asyncio.create_task(
+            self._probe_group_offline(chat_id, session_name, user_id, reason=reason)
+        )
+        self._group_offline_probe_tasks[chat_id] = task
+
+    def _cancel_group_offline_probe(self, chat_id: str):
+        task = self._group_offline_probe_tasks.pop(chat_id, None)
+        if task and not task.done():
+            task.cancel()
+
     def _remove_binding_by_chat(self, chat_id: str, force: bool = False):
         """移除 chat_id 的绑定。
         群聊绑定默认不移除（避免断开后无法解散群）；
@@ -235,8 +887,18 @@ class LarkHandler:
     async def _attach(self, chat_id: str, session_name: str,
                       user_id: Optional[str] = None) -> bool:
         """统一 attach 逻辑（私聊/群聊共用）"""
+        # 已经连接到同一会话时直接复用，避免重复 attach 造成瞬断
+        current_session = self._chat_sessions.get(chat_id)
+        current_bridge = self._bridges.get(chat_id)
+        if current_bridge and current_bridge.running and current_session == session_name:
+            if chat_id in self._group_chat_ids:
+                self._cancel_group_offline_probe(chat_id)
+                self._set_group_status(chat_id, session_name, 'active')
+            self._capture_round_diff_baseline_for_chat(chat_id, session_name)
+            return True
+
         # 在断开旧连接之前，先更新旧流式卡片为已断开状态（仅卡片模式）
-        old_session = self._chat_sessions.get(chat_id)
+        old_session = current_session
         old_slice = self._stop_poller(chat_id)
         if old_slice and old_session and self._is_card_mode:
             await self._update_card_disconnected(chat_id, old_session, old_slice)
@@ -249,15 +911,25 @@ class LarkHandler:
         self._chat_sessions.pop(chat_id, None)
         self._detached_slices.pop(chat_id, None)
 
-        def on_disconnect():
-            asyncio.create_task(self._on_disconnect(chat_id, session_name))
+        bridge = SessionBridge(session_name)
 
-        bridge = SessionBridge(session_name, on_disconnect=on_disconnect)
+        def on_disconnect():
+            asyncio.create_task(self._on_disconnect(
+                chat_id,
+                session_name,
+                expected_client_id=bridge.client_id,
+            ))
+
+        bridge.on_disconnect = on_disconnect
         if await bridge.connect():
             self._bridges[chat_id] = bridge
             self._chat_sessions[chat_id] = session_name
             self._start_poller(chat_id, session_name, is_group=(chat_id in self._group_chat_ids),
                                notify_user_id=user_id)
+            if chat_id in self._group_chat_ids:
+                self._cancel_group_offline_probe(chat_id)
+                self._set_group_status(chat_id, session_name, 'active')
+            self._capture_round_diff_baseline_for_chat(chat_id, session_name)
             _track_stats('lark', 'attach', session_name=session_name,
                          chat_id=chat_id)
             return True
@@ -271,8 +943,18 @@ class LarkHandler:
         self._chat_sessions.pop(chat_id, None)
         self._stop_poller(chat_id)
 
-    async def _on_disconnect(self, chat_id: str, session_name: str):
+    async def _on_disconnect(self, chat_id: str, session_name: str,
+                             expected_client_id: Optional[str] = None):
         """服务端关闭连接时的统一处理"""
+        current = self._bridges.get(chat_id)
+        # 忽略旧 bridge 的延迟断线回调，避免误清理新连接
+        if expected_client_id and current and current.client_id != expected_client_id:
+            logger.info(
+                f"忽略过期断线回调: chat_id={chat_id[:8]}..., session={session_name}, "
+                f"expected_client={expected_client_id[:8]}..., current_client={current.client_id[:8]}..."
+            )
+            return
+
         logger.info(f"会话 '{session_name}' 断线, chat_id={chat_id[:8]}...")
         _track_stats('lark', 'disconnect', session_name=session_name,
                      chat_id=chat_id)
@@ -285,8 +967,14 @@ class LarkHandler:
         if active_slice and self._is_card_mode:
             await self._update_card_disconnected(chat_id, session_name, active_slice)
 
-        # 会话退出时自动解散绑定到该会话的所有专属群聊
-        await self._disband_groups_for_session(session_name, source="disconnect")
+        # 生命周期管理：会话断开后将该会话的专属群进入 suspect_offline，防抖后再离线
+        for cid in list(self._group_chat_ids):
+            if self._chat_bindings.get(cid) == session_name:
+                self._schedule_group_offline_probe(
+                    cid,
+                    session_name,
+                    reason=f"会话 {session_name} 连接断开",
+                )
 
     # ── 消息入口 ────────────────────────────────────────────────────────────
 
@@ -297,6 +985,19 @@ class LarkHandler:
         text = text.strip()
 
         try:
+            # 清理飞书文本里常见的不可见字符，避免 "/skills" 被误判为普通文本
+            text = text.replace("\ufeff", "").replace("\u200b", "").strip()
+            # 兼容全角斜杠命令（／skills）
+            if text.startswith("／"):
+                text = "/" + text[1:]
+            # 兼容全角感叹号命令（！pwd），用于 Claude Bash mode
+            if text.startswith("！"):
+                text = "!" + text[1:]
+
+            if not text:
+                if chat_type != "p2p":
+                    await self._show_group_entry_card(user_id, chat_id)
+                return
             # 飞书菜单发送的中文名称 → 映射为命令
             menu_alias = _MENU_ALIASES.get(text)
             if menu_alias:
@@ -363,6 +1064,10 @@ class LarkHandler:
             await self._cmd_ls(user_id, chat_id, args, tree=(command == "/tree"))
         elif command == "/new-group":
             await self._cmd_new_group(user_id, chat_id, args)
+        elif command == "/summarize-now":
+            await self._cmd_summarize_now(user_id, chat_id)
+        elif command == "/diff":
+            await self._cmd_view_round_diff(user_id, chat_id)
         elif command == "/help":
             await self._cmd_help(user_id, chat_id)
         elif command == "/menu":
@@ -398,6 +1103,16 @@ class LarkHandler:
         """连接到会话"""
         session_name = args.strip()
 
+        if chat_id in self._group_chat_ids:
+            if not session_name:
+                await self._cmd_group_choose_takeover(user_id, chat_id, message_id=message_id)
+                return
+            await card_service.send_text(
+                chat_id,
+                "⚠️ 群聊切换会话会影响当前 AI 工作上下文，请谨慎操作。\n"
+                "建议优先尝试恢复原会话，仅在原会话无法恢复时再切换。"
+            )
+
         if not session_name:
             await self._cmd_list(user_id, chat_id, message_id=message_id)
             return
@@ -424,8 +1139,15 @@ class LarkHandler:
         if chat_id not in self._bridges and chat_id not in self._chat_sessions:
             await card_service.send_text(chat_id, "当前未连接到任何会话")
             return
+
+        session_name = self._chat_sessions.get(chat_id) or self._chat_bindings.get(chat_id) or ""
         self._remove_binding_by_chat(chat_id)
         await self._detach(chat_id)
+
+        if chat_id in self._group_chat_ids and session_name:
+            self._cancel_group_offline_probe(chat_id)
+            self._set_group_status(chat_id, session_name, 'offline', reason='手动断开连接，请恢复或接管会话')
+
         await self._cmd_menu(user_id, chat_id, message_id=message_id)
 
     async def _cmd_list(self, user_id: str, chat_id: str,
@@ -433,17 +1155,26 @@ class LarkHandler:
         """列出会话（等价于菜单）"""
         await self._cmd_menu(user_id, chat_id, message_id=message_id)
 
-    async def _cmd_status(self, user_id: str, chat_id: str):
+    async def _cmd_status(self, user_id: str, chat_id: str, message_id: Optional[str] = None):
         """显示状态"""
         session_name = self._chat_sessions.get(chat_id)
         bridge = self._bridges.get(chat_id)
         if bridge and bridge.running and session_name:
             card = build_status_card(True, session_name)
-        else:
-            card = build_status_card(False)
-        card_id = await card_service.create_card(card)
-        if card_id:
-            await card_service.send_card(chat_id, card_id)
+            await self._send_or_update_card(chat_id, card, message_id)
+            return
+
+        if chat_id in self._group_chat_ids:
+            await self._cmd_group_show_recovery(
+                user_id,
+                chat_id,
+                message_id=message_id,
+                reason_text="当前群未连接会话，请先恢复或接管会话。",
+            )
+            return
+
+        card = build_status_card(False)
+        await self._send_or_update_card(chat_id, card, message_id)
 
     async def _cmd_start(self, user_id: str, chat_id: str, args: str):
         """启动新会话"""
@@ -623,13 +1354,6 @@ class LarkHandler:
             await card_service.send_text(chat_id, f"错误: 会话 '{session_name}' 不存在")
             return
 
-        # 解散绑定该会话的专属群聊（必须在断开连接之前，否则 _chat_bindings 已被清除）
-        for cid in list(self._group_chat_ids):
-            if self._chat_bindings.get(cid) == session_name:
-                ok, err = await self._disband_group_via_api(cid)
-                if not ok:
-                    logger.warning(f"关闭会话时解散群 {cid} 失败: {err}")
-
         # 断开所有连接到此会话的 chat
         for cid, sname in list(self._chat_sessions.items()):
             if sname == session_name:
@@ -637,14 +1361,23 @@ class LarkHandler:
                 if active_slice and self._is_card_mode:
                     await self._update_card_disconnected(cid, sname, active_slice)
                 await self._detach(cid)
-                self._remove_binding_by_chat(cid, force=True)
+                if cid in self._group_chat_ids:
+                    # 群聊生命周期：会话关闭后保留群，标记为离线
+                    self._set_group_status(cid, session_name, 'offline', reason=f"会话 {session_name} 已终止")
+                else:
+                    self._remove_binding_by_chat(cid, force=True)
 
-        # 清理所有残留绑定（包括已断开的群聊，其绑定在断开时被保留）
+        # 清理残留绑定：群聊保留并标记离线，非群聊移除绑定
+        changed = False
         for cid in [c for c, s in list(self._chat_bindings.items()) if s == session_name]:
-            self._group_chat_ids.discard(cid)
-            self._chat_bindings.pop(cid, None)
-        self._save_chat_bindings()
-        self._save_group_chat_ids()
+            if cid in self._group_chat_ids:
+                self._set_group_status(cid, session_name, 'offline', reason=f"会话 {session_name} 已终止")
+            else:
+                self._chat_bindings.pop(cid, None)
+                changed = True
+
+        if changed:
+            self._save_chat_bindings()
 
         if tmux_session_exists(session_name):
             tmux_kill_session(session_name)
@@ -683,7 +1416,12 @@ class LarkHandler:
         except Exception:
             pass
         blocks_slice = blocks[active_slice.start_idx:]
-        card = build_stream_card(blocks_slice, disconnected=True, session_name=session_name)
+        card = build_stream_card(
+            blocks_slice,
+            disconnected=True,
+            session_name=session_name,
+            is_group=(chat_id in self._group_chat_ids),
+        )
         try:
             return await card_service.update_card(
                 card_id=active_slice.card_id,
@@ -720,7 +1458,16 @@ class LarkHandler:
         await self._detach(chat_id)
 
         blocks_slice = blocks[active_slice.start_idx:] if active_slice else blocks
-        card = build_stream_card(blocks_slice, disconnected=True, session_name=session_name)
+        card = build_stream_card(
+            blocks_slice,
+            disconnected=True,
+            session_name=session_name,
+            is_group=(chat_id in self._group_chat_ids),
+        )
+
+        if chat_id in self._group_chat_ids:
+            self._cancel_group_offline_probe(chat_id)
+            self._set_group_status(chat_id, session_name, 'offline', reason='手动断开连接，请恢复或接管会话')
 
         updated = False
         if active_slice:
@@ -773,6 +1520,26 @@ class LarkHandler:
         )
         await self._cmd_menu(user_id, chat_id)
 
+    async def _show_group_entry_card(self, user_id: str, chat_id: str):
+        """群聊首次 @ 但未带文本时，主动展示入口卡，降低使用门槛。"""
+        if chat_id not in self._group_chat_ids:
+            await self._cmd_menu(user_id, chat_id)
+            return
+
+        session_name = self._chat_bindings.get(chat_id) or self._chat_sessions.get(chat_id)
+        bridge = self._bridges.get(chat_id)
+        connected = bool(bridge and bridge.running)
+
+        if connected:
+            await self._cmd_menu(user_id, chat_id)
+            return
+
+        if session_name:
+            reason = f"当前会话 {session_name} 离线，请先恢复会话。"
+        else:
+            reason = "当前群未绑定可用会话，请先选择接管会话。"
+        await self._cmd_group_show_recovery(user_id, chat_id, reason_text=reason)
+
     async def _cmd_help(self, user_id: str, chat_id: str,
                          message_id: Optional[str] = None):
         """显示帮助"""
@@ -782,10 +1549,603 @@ class LarkHandler:
     async def _cmd_menu(self, user_id: str, chat_id: str,
                          message_id: Optional[str] = None, page: int = 0):
         """显示会话列表菜单"""
+        # 专属群聊：展示精简菜单，避免误操作切换会话
+        if chat_id in self._group_chat_ids:
+            session_name = self._chat_bindings.get(chat_id) or self._chat_sessions.get(chat_id)
+            bridge = self._bridges.get(chat_id)
+            connected = bool(bridge and bridge.running)
+            meta = self._get_group_meta(chat_id)
+            card = build_group_menu_card(
+                session_name,
+                connected=connected,
+                status=str(meta.get('status', 'active' if connected else 'offline')),
+                reason=str(meta.get('reason', '') or ''),
+            )
+            await self._send_or_update_card(chat_id, card, message_id)
+            return
+
         sessions = list_active_sessions()
         current = self._chat_sessions.get(chat_id)
-        card = build_menu_card(sessions, current_session=current, page=page)
+
+        # 会话 -> 专属群 chat_id 映射（用于会话列表展示“进入群聊/创建群聊”）
+        session_groups: Dict[str, str] = {}
+        for cid in sorted(self._group_chat_ids):
+            session_name = self._chat_bindings.get(cid)
+            if session_name and session_name not in session_groups:
+                session_groups[session_name] = cid
+
+        notify_enabled = self._poller.get_notify_enabled() if self._is_card_mode and self._poller else False
+        urgent_enabled = self._poller.get_urgent_enabled() if self._is_card_mode and self._poller else False
+        bypass_enabled = self._poller.get_bypass_enabled() if self._is_card_mode and self._poller else False
+
+        card = build_menu_card(
+            sessions,
+            current_session=current,
+            session_groups=session_groups,
+            page=page,
+            notify_enabled=notify_enabled,
+            urgent_enabled=urgent_enabled,
+            bypass_enabled=bypass_enabled,
+            show_preferences=bool(self._is_card_mode and self._poller),
+        )
         await self._send_or_update_card(chat_id, card, message_id)
+
+    async def _cmd_group_show_recovery(self, user_id: str, chat_id: str,
+                                       message_id: Optional[str] = None,
+                                       reason_text: str = ""):
+        """群聊离线恢复入口卡片"""
+        if chat_id not in self._group_chat_ids:
+            await self._cmd_menu(user_id, chat_id, message_id=message_id)
+            return
+
+        bridge = self._bridges.get(chat_id)
+        session_name = self._chat_bindings.get(chat_id) or self._chat_sessions.get(chat_id)
+        connected = bool(bridge and bridge.running and self._chat_sessions.get(chat_id))
+        if connected:
+            await self._cmd_menu(user_id, chat_id, message_id=message_id)
+            return
+
+        reason = reason_text or self._get_group_offline_reason(chat_id)
+        card = build_group_recovery_card(session_name, reason=reason)
+        await self._send_or_update_card(chat_id, card, message_id)
+
+    async def _cmd_group_reconnect_original(self, user_id: str, chat_id: str,
+                                            message_id: Optional[str] = None):
+        """群聊：重连当前绑定会话（single-flight + request_id 幂等）"""
+        if chat_id not in self._group_chat_ids:
+            await self._cmd_menu(user_id, chat_id, message_id=message_id)
+            return
+
+        session_name = self._chat_bindings.get(chat_id) or self._chat_sessions.get(chat_id)
+        if not session_name:
+            await self._cmd_group_show_recovery(
+                user_id,
+                chat_id,
+                message_id=message_id,
+                reason_text="当前群未绑定会话，请选择现有会话接管。",
+            )
+            return
+
+        bridge = self._bridges.get(chat_id)
+        if bridge and bridge.running and self._chat_sessions.get(chat_id) == session_name:
+            if message_id:
+                await self._cmd_menu(user_id, chat_id, message_id=message_id)
+            else:
+                await card_service.send_text(chat_id, f"ℹ️ 当前会话 {session_name} 已在线，无需恢复。")
+            return
+
+        last = self._group_recovery_last_result.get(chat_id)
+        now_ts = int(time.time())
+        if last and last.get('session') == session_name and now_ts - int(last.get('ts', 0)) <= 30:
+            ok = bool(last.get('ok'))
+            ok_text = "成功" if ok else "失败"
+            if message_id:
+                if ok:
+                    await self._cmd_menu(user_id, chat_id, message_id=message_id)
+                else:
+                    await self._cmd_group_show_recovery(
+                        user_id,
+                        chat_id,
+                        message_id=message_id,
+                        reason_text=f"最近恢复结果（request_id={last.get('request_id', '-')}, 失败），请重新选择恢复方式。",
+                    )
+                return
+            await card_service.send_text(chat_id, f"ℹ️ 已返回最近恢复结果（request_id={last.get('request_id', '-')}, {ok_text}）。")
+            return
+
+        if chat_id in self._group_recovery_inflight:
+            rid = self._group_recovery_inflight[chat_id].get('request_id', '-')
+            if message_id:
+                await self._cmd_group_show_recovery(
+                    user_id,
+                    chat_id,
+                    message_id=message_id,
+                    reason_text=f"恢复进行中（request_id={rid}），请稍候。",
+                )
+                return
+            await card_service.send_text(chat_id, f"⏳ 恢复进行中（request_id={rid}），请稍候。")
+            return
+
+        request_id = str(uuid.uuid4())
+        self._group_recovery_inflight[chat_id] = {"request_id": request_id, "kind": "reconnect", "session": session_name}
+
+        try:
+            if message_id:
+                await self._cmd_group_show_recovery(
+                    user_id,
+                    chat_id,
+                    message_id=message_id,
+                    reason_text=f"恢复进行中（request_id={request_id}），正在重连原会话。",
+                )
+
+            lock = self._ensure_group_recovery_lock(chat_id)
+            async with lock:
+                ok = await self._attach(chat_id, session_name, user_id=user_id)
+                if ok:
+                    ready = await self._verify_group_recovery_ready(chat_id, session_name)
+                    if not ready:
+                        self._set_group_status(chat_id, session_name, 'offline', reason=f"恢复校验失败：会话 {session_name} 尚未就绪")
+                        self._group_recovery_last_result[chat_id] = {
+                            "request_id": request_id,
+                            "ok": False,
+                            "session": session_name,
+                            "reason": "not_ready",
+                            "ts": int(time.time()),
+                        }
+                        await self._cmd_group_show_recovery(
+                            user_id,
+                            chat_id,
+                            message_id=message_id,
+                            reason_text=f"恢复校验失败（request_id={request_id}）：会话 {session_name} 尚未就绪，请重新恢复或接管。",
+                        )
+                        return
+
+                    self._chat_bindings[chat_id] = session_name
+                    self._save_chat_bindings()
+                    self._set_group_status(chat_id, session_name, 'active')
+                    injected = await self._inject_recovery_context(chat_id)
+                    msg = f"✅ 已恢复会话：{session_name}（request_id={request_id}）"
+                    if not injected:
+                        msg += "\n⚠️ 上下文恢复未完成，请手动补充背景后继续。"
+                        if message_id:
+                            self._set_group_status(chat_id, session_name, 'active', reason="上下文恢复未完成，请手动补充背景后继续。")
+                    if not message_id:
+                        await card_service.send_text(chat_id, msg)
+                    self._group_recovery_last_result[chat_id] = {
+                        "request_id": request_id,
+                        "ok": True,
+                        "session": session_name,
+                        "ts": int(time.time()),
+                    }
+                    await self._cmd_menu(user_id, chat_id, message_id=message_id)
+                    return
+
+                self._set_group_status(chat_id, session_name, 'offline', reason=f"重连失败：原会话 {session_name} 当前不可连接")
+                self._group_recovery_last_result[chat_id] = {
+                    "request_id": request_id,
+                    "ok": False,
+                    "session": session_name,
+                    "reason": "unreachable",
+                    "ts": int(time.time()),
+                }
+                await self._cmd_group_show_recovery(
+                    user_id,
+                    chat_id,
+                    message_id=message_id,
+                    reason_text=f"重连失败：原会话 {session_name} 当前不可连接，请选择现有会话接管。",
+                )
+        finally:
+            self._group_recovery_inflight.pop(chat_id, None)
+
+    async def _cmd_group_choose_takeover(self, user_id: str, chat_id: str,
+                                         message_id: Optional[str] = None):
+        """群聊：展示可接管会话列表"""
+        if chat_id not in self._group_chat_ids:
+            await self._cmd_menu(user_id, chat_id, message_id=message_id)
+            return
+
+        session_name = self._chat_bindings.get(chat_id) or self._chat_sessions.get(chat_id)
+        sessions = list_active_sessions()
+        card = build_group_recovery_card(
+            session_name,
+            reason="请选择一个现有会话接管到本群。",
+            sessions=sessions,
+        )
+        await self._send_or_update_card(chat_id, card, message_id)
+
+    async def _cmd_group_takeover_session(self, user_id: str, chat_id: str,
+                                          session_name: str,
+                                          message_id: Optional[str] = None):
+        """群聊：接管到指定现有会话（single-flight + request_id 幂等）"""
+        if chat_id not in self._group_chat_ids:
+            await self._cmd_menu(user_id, chat_id, message_id=message_id)
+            return
+
+        session_name = (session_name or "").strip()
+        if not session_name:
+            await self._cmd_group_choose_takeover(user_id, chat_id, message_id=message_id)
+            return
+
+        last = self._group_recovery_last_result.get(chat_id)
+        now_ts = int(time.time())
+        if last and last.get('session') == session_name and now_ts - int(last.get('ts', 0)) <= 30:
+            ok = bool(last.get('ok'))
+            ok_text = "成功" if ok else "失败"
+            if message_id:
+                if ok:
+                    await self._cmd_menu(user_id, chat_id, message_id=message_id)
+                else:
+                    await self._cmd_group_show_recovery(
+                        user_id,
+                        chat_id,
+                        message_id=message_id,
+                        reason_text=f"最近恢复结果（request_id={last.get('request_id', '-')}, 失败），请重新选择恢复方式。",
+                    )
+                return
+            await card_service.send_text(chat_id, f"ℹ️ 已返回最近恢复结果（request_id={last.get('request_id', '-')}, {ok_text}）。")
+            return
+
+        if chat_id in self._group_recovery_inflight:
+            rid = self._group_recovery_inflight[chat_id].get('request_id', '-')
+            if message_id:
+                await self._cmd_group_show_recovery(
+                    user_id,
+                    chat_id,
+                    message_id=message_id,
+                    reason_text=f"恢复进行中（request_id={rid}），请稍候。",
+                )
+                return
+            await card_service.send_text(chat_id, f"⏳ 恢复进行中（request_id={rid}），请稍候。")
+            return
+
+        sessions = list_active_sessions()
+        if not any(s.get("name") == session_name for s in sessions):
+            card = build_group_recovery_card(
+                self._chat_bindings.get(chat_id) or self._chat_sessions.get(chat_id),
+                reason=f"会话 {session_name} 不存在或已退出，请重新选择。",
+                sessions=sessions,
+            )
+            await self._send_or_update_card(chat_id, card, message_id)
+            return
+
+        request_id = str(uuid.uuid4())
+        self._group_recovery_inflight[chat_id] = {"request_id": request_id, "kind": "takeover", "session": session_name}
+
+        try:
+            if message_id:
+                await self._cmd_group_show_recovery(
+                    user_id,
+                    chat_id,
+                    message_id=message_id,
+                    reason_text=f"恢复进行中（request_id={request_id}），正在接管会话 {session_name}。",
+                )
+
+            lock = self._ensure_group_recovery_lock(chat_id)
+            async with lock:
+                ok = await self._attach(chat_id, session_name, user_id=user_id)
+                if not ok:
+                    self._set_group_status(chat_id, session_name, 'offline', reason=f"接管失败：会话 {session_name} 当前不可连接")
+                    self._group_recovery_last_result[chat_id] = {
+                        "request_id": request_id,
+                        "ok": False,
+                        "session": session_name,
+                        "reason": "unreachable",
+                        "ts": int(time.time()),
+                    }
+                    card = build_group_recovery_card(
+                        self._chat_bindings.get(chat_id) or self._chat_sessions.get(chat_id),
+                        reason=f"接管失败：会话 {session_name} 当前不可连接，请重新选择或稍后重试。",
+                        sessions=sessions,
+                    )
+                    await self._send_or_update_card(chat_id, card, message_id)
+                    return
+
+                ready = await self._verify_group_recovery_ready(chat_id, session_name)
+                if not ready:
+                    self._set_group_status(chat_id, session_name, 'offline', reason=f"接管校验失败：会话 {session_name} 尚未就绪")
+                    self._group_recovery_last_result[chat_id] = {
+                        "request_id": request_id,
+                        "ok": False,
+                        "session": session_name,
+                        "reason": "not_ready",
+                        "ts": int(time.time()),
+                    }
+                    card = build_group_recovery_card(
+                        self._chat_bindings.get(chat_id) or self._chat_sessions.get(chat_id),
+                        reason=f"接管校验失败（request_id={request_id}）：会话 {session_name} 尚未就绪，请重新选择或稍后重试。",
+                        sessions=sessions,
+                    )
+                    await self._send_or_update_card(chat_id, card, message_id)
+                    return
+
+                self._chat_bindings[chat_id] = session_name
+                self._save_chat_bindings()
+                self._set_group_status(chat_id, session_name, 'active')
+                injected = await self._inject_recovery_context(chat_id)
+                msg = f"✅ 接管成功，当前会话：{session_name}（request_id={request_id}）"
+                if not injected:
+                    msg += "\n⚠️ 上下文恢复未完成，请手动补充背景后继续。"
+                    if message_id:
+                        self._set_group_status(chat_id, session_name, 'active', reason="上下文恢复未完成，请手动补充背景后继续。")
+                if not message_id:
+                    await card_service.send_text(chat_id, msg)
+                self._group_recovery_last_result[chat_id] = {
+                    "request_id": request_id,
+                    "ok": True,
+                    "session": session_name,
+                    "ts": int(time.time()),
+                }
+                await self._cmd_menu(user_id, chat_id, message_id=message_id)
+        finally:
+            self._group_recovery_inflight.pop(chat_id, None)
+
+    async def _cmd_summarize_now(self, user_id: str, chat_id: str,
+                                 message_id: Optional[str] = None):
+        """群聊手动触发总结"""
+        if chat_id not in self._group_chat_ids:
+            await card_service.send_text(chat_id, "该命令仅支持在专属群聊中使用。")
+            return
+
+        if chat_id in self._group_recovery_inflight:
+            rid = self._group_recovery_inflight[chat_id].get('request_id', '-')
+            if message_id:
+                await self._cmd_group_show_recovery(
+                    user_id,
+                    chat_id,
+                    message_id=message_id,
+                    reason_text=f"恢复进行中（request_id={rid}），请稍后再触发总结。",
+                )
+                return
+            await card_service.send_text(chat_id, f"⏳ 当前正在恢复会话（request_id={rid}），稍后再触发总结。")
+            return
+
+        bridge = self._bridges.get(chat_id)
+        if not bridge or not bridge.running:
+            await self._cmd_group_show_recovery(
+                user_id,
+                chat_id,
+                message_id=message_id,
+                reason_text="当前会话离线，请先恢复会话后再总结。",
+            )
+            return
+
+        lock = self._group_summary_locks.get(chat_id)
+        if lock and lock.locked():
+            if message_id:
+                await self._cmd_menu(user_id, chat_id, message_id=message_id)
+                return
+            await card_service.send_text(chat_id, "⏳ 总结任务进行中，请稍后再试。")
+            return
+
+        ok = await self._emit_group_summary(chat_id, force=True, trigger="manual")
+        if message_id:
+            await self._cmd_menu(user_id, chat_id, message_id=message_id)
+            return
+        if ok:
+            await card_service.send_text(chat_id, "✅ 已触发群聊总结。")
+        else:
+            await card_service.send_text(chat_id, "⚠️ 总结触发失败（上下文不足或暂不可用）。")
+
+    @staticmethod
+    def _truncate_text(text: str, limit: int) -> str:
+        content = (text or "").strip()
+        if len(content) <= limit:
+            return content
+        return content[:limit].rstrip() + "\n...（已截断）"
+
+    @staticmethod
+    def _format_code_block(text: str, *, lang: str = "text", limit: int = 2200) -> str:
+        content = (text or "").replace("```", "'''")
+        content = LarkHandler._truncate_text(content, limit)
+        return f"```{lang}\n{content or '(empty)'}\n```"
+
+    def _git_run(self, repo_root: Path, args: List[str], *, timeout: int = 8) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", *args],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+
+    def _ensure_round_diff_baseline(self, chat_id: str, session_name: str, repo_root: Path) -> Optional[Dict[str, Any]]:
+        """确保 chat 级“本轮对话变更”基线已建立。"""
+        baseline = self._round_diff_baseline.get(chat_id)
+        if baseline and baseline.get("session_name") == session_name and baseline.get("repo_root") == str(repo_root):
+            return baseline
+
+        inside = self._git_run(repo_root, ["rev-parse", "--is-inside-work-tree"], timeout=5)
+        if inside.returncode != 0:
+            return None
+
+        head_proc = self._git_run(repo_root, ["rev-parse", "HEAD"], timeout=5)
+        head = (head_proc.stdout or "").strip() if head_proc.returncode == 0 else ""
+
+        merge_base = ""
+        mb_proc = self._git_run(repo_root, ["merge-base", "HEAD", "main"], timeout=5)
+        if mb_proc.returncode == 0:
+            merge_base = (mb_proc.stdout or "").strip()
+
+        status_proc = self._git_run(repo_root, ["status", "--short"], timeout=8)
+        staged_proc = self._git_run(repo_root, ["diff", "--no-color", "--staged", "--unified=1"], timeout=8)
+        unstaged_proc = self._git_run(repo_root, ["diff", "--no-color", "--unified=1"], timeout=8)
+
+        baseline_status_lines = [ln.rstrip() for ln in (status_proc.stdout or "").splitlines() if ln.strip()]
+        baseline_diff = "\n".join([
+            (staged_proc.stdout or "").strip(),
+            (unstaged_proc.stdout or "").strip(),
+        ]).strip()
+
+        baseline = {
+            "session_name": session_name,
+            "repo_root": str(repo_root),
+            "merge_base": merge_base,
+            "baseline_head": head,
+            "baseline_status_lines": baseline_status_lines,
+            "baseline_diff": baseline_diff,
+            "captured_at": int(time.time()),
+        }
+        self._round_diff_baseline[chat_id] = baseline
+        return baseline
+
+    def _capture_round_diff_baseline_for_chat(self, chat_id: str, session_name: str):
+        """在 attach 成功后捕获本 chat 的对话基线。"""
+        try:
+            sessions = list_active_sessions()
+            current = next((s for s in sessions if s.get("name") == session_name), None)
+            cwd = str((current or {}).get("cwd", "") or "").strip()
+            if not cwd:
+                return
+            # 每次显式 attach/reconnect 都重置“本轮”范围
+            self._round_diff_baseline.pop(chat_id, None)
+            self._ensure_round_diff_baseline(chat_id, session_name, Path(cwd))
+        except Exception as e:
+            logger.debug(f"捕获 round diff 基线失败: {e}")
+
+    async def _cmd_view_round_diff(self, user_id: str, chat_id: str,
+                                   message_id: Optional[str] = None):
+        """查看当前 chat 绑定会话的工作区变更（文件清单 + diff 摘要）。"""
+        session_name = self._chat_sessions.get(chat_id) or self._chat_bindings.get(chat_id)
+        if not session_name:
+            await card_service.send_text(chat_id, "当前 chat 未绑定会话，无法定位本轮变更。请先 /attach 或在群里恢复会话。")
+            return
+
+        sessions = list_active_sessions()
+        current = next((s for s in sessions if s.get("name") == session_name), None)
+        cwd = str((current or {}).get("cwd", "") or "").strip()
+        if not cwd:
+            await card_service.send_text(chat_id, f"未找到会话 `{session_name}` 的工作目录，无法查看本轮变更。")
+            return
+
+        repo_root = Path(cwd)
+
+        try:
+            inside = self._git_run(repo_root, ["rev-parse", "--is-inside-work-tree"], timeout=5)
+            if inside.returncode != 0:
+                await card_service.send_text(chat_id, f"会话 `{session_name}` 当前目录不是 Git 仓库，无法查看变更 diff。")
+                return
+
+            baseline = self._ensure_round_diff_baseline(chat_id, session_name, repo_root)
+
+            head_proc = self._git_run(repo_root, ["rev-parse", "HEAD"], timeout=5)
+            current_head = (head_proc.stdout or "").strip() if head_proc.returncode == 0 else ""
+
+            status_proc = self._git_run(repo_root, ["status", "--short"], timeout=8)
+            staged_proc = self._git_run(repo_root, ["diff", "--no-color", "--staged", "--unified=1"], timeout=8)
+            unstaged_proc = self._git_run(repo_root, ["diff", "--no-color", "--unified=1"], timeout=8)
+
+            status_lines = [ln.rstrip() for ln in (status_proc.stdout or "").splitlines() if ln.strip()]
+            files_text = "\n".join(status_lines[:25]) if status_lines else "工作区无未提交变更。"
+            if len(status_lines) > 25:
+                files_text += f"\n...（其余 {len(status_lines) - 25} 项已省略）"
+
+            staged_diff = (staged_proc.stdout or "").strip()
+            unstaged_diff = (unstaged_proc.stdout or "").strip()
+            current_diff = "\n".join([staged_diff, unstaged_diff]).strip()
+
+            round_status_text = ""
+            round_diff_text = ""
+            has_round_delta = False
+
+            if baseline:
+                baseline_status_lines = [str(x) for x in (baseline.get("baseline_status_lines") or [])]
+                baseline_diff = str(baseline.get("baseline_diff", "") or "")
+
+                status_delta = list(difflib.unified_diff(
+                    baseline_status_lines,
+                    status_lines,
+                    fromfile="baseline-status",
+                    tofile="current-status",
+                    lineterm="",
+                ))
+                diff_delta = list(difflib.unified_diff(
+                    baseline_diff.splitlines(),
+                    current_diff.splitlines(),
+                    fromfile="baseline-diff",
+                    tofile="current-diff",
+                    lineterm="",
+                ))
+                round_status_text = "\n".join(status_delta).strip()
+                round_diff_text = "\n".join(diff_delta).strip()
+                has_round_delta = bool(round_status_text or round_diff_text)
+
+            captured_at = int((baseline or {}).get("captured_at", 0) or 0)
+            captured_at_str = _datetime.fromtimestamp(captured_at).strftime("%Y-%m-%d %H:%M:%S") if captured_at else "未知"
+
+            elements: List[Dict[str, Any]] = [
+                {
+                    "tag": "markdown",
+                    "content": (
+                        "**本轮变更范围：仅当前 chat 对话期间新增的变更（相对会话接入基线）**\n"
+                        f"会话：`{session_name}`\n"
+                        f"仓库路径：`{repo_root}`\n"
+                        f"基线时间：`{captured_at_str}`\n"
+                        f"基线 HEAD：`{(baseline or {}).get('baseline_head', '') or '(unknown)'}`\n"
+                        f"当前 HEAD：`{current_head or '(unknown)'}`"
+                    ),
+                },
+                {"tag": "hr"},
+                {"tag": "markdown", "content": "**本轮新增/变化文件（相对基线）**"},
+            ]
+
+            if baseline and has_round_delta:
+                elements.append({"tag": "markdown", "content": self._format_code_block(round_status_text or "(有变更，但状态列表为空)", limit=1800)})
+            elif baseline:
+                elements.append({"tag": "markdown", "content": self._format_code_block("本轮尚无新增变更（相对基线）。", limit=600)})
+            else:
+                elements.append({"tag": "markdown", "content": self._format_code_block("当前无法建立本轮基线，回退为工作区视角。", limit=600)})
+
+            if baseline and round_diff_text:
+                elements.extend([
+                    {"tag": "hr"},
+                    {"tag": "markdown", "content": "**本轮关键 Diff（相对基线）**"},
+                    {"tag": "markdown", "content": self._format_code_block(round_diff_text, lang="diff", limit=2600)},
+                ])
+
+            elements.extend([
+                {"tag": "hr"},
+                {"tag": "markdown", "content": "**当前工作区快照（用于对照）**"},
+                {"tag": "markdown", "content": self._format_code_block(files_text, limit=1400)},
+            ])
+
+            if staged_diff:
+                elements.extend([
+                    {"tag": "hr"},
+                    {"tag": "markdown", "content": "**工作区 Diff（已暂存）**"},
+                    {"tag": "markdown", "content": self._format_code_block(staged_diff, lang="diff", limit=2200)},
+                ])
+
+            if unstaged_diff:
+                elements.extend([
+                    {"tag": "hr"},
+                    {"tag": "markdown", "content": "**工作区 Diff（未暂存）**"},
+                    {"tag": "markdown", "content": self._format_code_block(unstaged_diff, lang="diff", limit=2200)},
+                ])
+
+            elements.extend([
+                {"tag": "hr"},
+                {
+                    "tag": "markdown",
+                    "content": (
+                        "**说明**\n"
+                        "- 本轮视角：以当前 chat 连接该会话时的基线为起点。\n"
+                        "- 若你希望重置“本轮”范围，重新 /attach（或恢复接管）该会话即可。"
+                    ),
+                },
+                {"tag": "hr"},
+                _build_menu_button_only(),
+            ])
+
+            card = {
+                "schema": "2.0",
+                "config": {"wide_screen_mode": True},
+                "header": _build_header("🔍 本轮变更", "blue"),
+                "body": {"elements": elements},
+            }
+            await self._send_or_update_card(chat_id, card, message_id)
+        except Exception as e:
+            logger.error(f"查看本轮变更失败: {e}", exc_info=True)
+            await card_service.send_text(chat_id, f"查看本轮变更失败：{e}")
 
     async def _cmd_toggle_notify(self, user_id: str, chat_id: str,
                                   message_id: Optional[str] = None):
@@ -1346,6 +2706,26 @@ class LarkHandler:
             )
             return
 
+        # A 方案：已存在群聊时不重复创建，直接进入已有群聊
+        existing_group_chat_id = next(
+            (
+                cid for cid in sorted(self._group_chat_ids)
+                if self._chat_bindings.get(cid) == session_name
+            ),
+            None,
+        )
+        if existing_group_chat_id:
+            # 已有群聊：刷新为活跃状态并返回直达链接
+            self._set_group_status(existing_group_chat_id, session_name, 'active')
+            await card_service.send_text(
+                chat_id,
+                "该会话已有专属群聊，点击进入：\n"
+                f"https://applink.feishu.cn/client/chat/open?openChatId={existing_group_chat_id}"
+            )
+            if message_id:
+                await self._cmd_list(user_id, chat_id, message_id=message_id)
+            return
+
         session = next((s for s in sessions if s["name"] == session_name), None)
         pid = session.get("pid") if session else None
         cwd = self._get_pid_cwd(pid) if pid else None
@@ -1393,8 +2773,11 @@ class LarkHandler:
             self._save_chat_bindings()
             self._group_chat_ids.add(group_chat_id)
             self._save_group_chat_ids()
+            self._set_group_status(group_chat_id, session_name, 'offline', reason="群聊新建完成，等待会话接管")
             # 立即 attach，让新群即刻开始接收 Claude 输出
             await self._attach(group_chat_id, session_name, user_id=user_id)
+            # 新建群后立即推送入口卡，避免用户进群后无反馈
+            await self._show_group_entry_card(user_id, group_chat_id)
 
             # 刷新会话列表卡片，使"创建群聊"按钮变为"进入群聊"
             await self._cmd_list(user_id, chat_id, message_id=message_id)
@@ -1463,6 +2846,9 @@ class LarkHandler:
                 if not ok:
                     logger.warning(f"{log_prefix}解散群 {cid[:8]}... API 失败: {err}")
         if disbanded:
+            for cid in disbanded:
+                self._group_meta.pop(cid, None)
+            self._save_group_meta()
             self._save_chat_bindings()
             self._save_group_chat_ids()
 
@@ -1486,6 +2872,7 @@ class LarkHandler:
             self._group_chat_ids.discard(group_chat_id)
             self._save_group_chat_ids()
             self._remove_binding_by_chat(group_chat_id, force=True)
+            self._remove_group_meta(group_chat_id)
             await self._detach(group_chat_id)
 
             if not feishu_ok:
@@ -1515,22 +2902,34 @@ class LarkHandler:
                 logger.info(f"自动恢复绑定: chat_id={chat_id[:8]}..., session={saved_session}")
                 ok = await self._attach(chat_id, saved_session, user_id=user_id)
                 if not ok:
-                    self._group_chat_ids.discard(chat_id)
-                    self._save_group_chat_ids()
-                    self._remove_binding_by_chat(chat_id, force=True)
-                    await card_service.send_text(
-                        chat_id, f"会话 '{saved_session}' 已不存在，请重新 /attach"
-                    )
-                    # 会话已不存在，解散绑定到该会话的所有专属群聊
-                    await self._disband_groups_for_session(saved_session, source="lazy")
+                    if chat_id in self._group_chat_ids:
+                        # 生命周期管理：保留群聊，标记为离线，避免自动解散
+                        self._set_group_status(chat_id, saved_session, 'offline', reason=f"会话 {saved_session} 当前离线")
+                        await self._cmd_group_show_recovery(
+                            user_id,
+                            chat_id,
+                            reason_text=f"会话 {saved_session} 当前离线，请先重连或接管。",
+                        )
+                    else:
+                        self._remove_binding_by_chat(chat_id, force=True)
+                        await card_service.send_text(
+                            chat_id, f"会话 '{saved_session}' 当前离线，请先 /start 后再重试"
+                        )
                     return
                 bridge = self._bridges.get(chat_id)
             else:
-                await self._show_unconnected_menu_entry(
-                    user_id,
-                    chat_id,
-                    reason_text="未连接到任何会话，已为你打开能力菜单。"
-                )
+                if chat_id in self._group_chat_ids:
+                    await self._cmd_group_show_recovery(
+                        user_id,
+                        chat_id,
+                        reason_text="当前群未绑定可用会话，请选择现有会话接管。",
+                    )
+                else:
+                    await self._show_unconnected_menu_entry(
+                        user_id,
+                        chat_id,
+                        reason_text="未连接到任何会话，已为你打开能力菜单。"
+                    )
                 return
 
         if not bridge:
@@ -1541,15 +2940,53 @@ class LarkHandler:
             freeze_result = await self._poller.freeze_current_card(chat_id)
             logger.info(f"[_forward_to_claude] freeze_current_card 返回: {freeze_result}")
 
-        # 发送用户输入
-        success = await bridge.send_input(text)
+        # 发送前记录快照中的 UserInput 计数，用于投递确认
+        before_snapshot = self._read_snapshot(chat_id)
+        before_user_inputs = self._count_user_input_blocks(before_snapshot)
+
+        # 发送用户输入（加超时，避免“已断开但无反馈”）
+        try:
+            success = await asyncio.wait_for(bridge.send_input(text), timeout=4.0)
+        except asyncio.TimeoutError:
+            logger.warning(f"发送输入超时: chat_id={chat_id[:8]}..., session={self._chat_sessions.get(chat_id, '-')}")
+            await card_service.send_text(
+                chat_id,
+                "⚠️ 消息投递超时：连接可能已断开但未及时上报。\n"
+                "建议点击“📋 菜单”后执行“🔗 恢复会话”或重新 /attach 再重试。"
+            )
+            return
+        except Exception as e:
+            logger.error(f"发送输入异常: {e}", exc_info=True)
+            await card_service.send_text(
+                chat_id,
+                "⚠️ 消息投递失败：发送过程中发生异常。\n"
+                "建议点击“📋 菜单”后执行“🔗 恢复会话”或重新 /attach 再重试。"
+            )
+            return
+
         if success:
-            # 文本模式：给用户即时反馈，确认消息已送达
-            if not self._is_card_mode:
-                await card_service.send_interactive_card(chat_id, _build_pending_card(text))
             self._kick_poller(chat_id)
+            reflected = await self._wait_user_input_reflected(chat_id, before_user_inputs)
+
+            if reflected:
+                # 文本模式：给用户即时反馈，确认消息已送达
+                if not self._is_card_mode:
+                    await card_service.send_interactive_card(chat_id, _build_pending_card(text))
+            else:
+                await card_service.send_text(
+                    chat_id,
+                    "⚠️ 当前会话状态异常：显示已连接，但本次输入未在终端侧确认落盘。\n"
+                    "建议点击“📋 菜单”后执行“🔗 恢复会话”或重新 /attach 再重试。"
+                )
+
+            if chat_id in self._group_chat_ids:
+                asyncio.create_task(self._maybe_emit_group_summary_after_delay(chat_id))
         else:
-            await card_service.send_text(chat_id, "发送失败")
+            await card_service.send_text(
+                chat_id,
+                "⚠️ 消息投递失败：连接可能已断开。\n"
+                "建议点击“📋 菜单”后执行“🔗 恢复会话”或重新 /attach 再重试。"
+            )
 
     # ── 选项处理 ─────────────────────────────────────────────────────────────
 
@@ -1976,7 +3413,7 @@ class LarkHandler:
 
             # 构建卡片
             card = build_monitor_list_card(monitored_chats)
-            await card_service.send_card(chat_id, card)
+            await card_service.create_and_send_card(chat_id, card)
 
         except Exception as e:
             logger.error(f"查看监听列表失败: {e}", exc_info=True)
@@ -2048,7 +3485,7 @@ class LarkHandler:
             # 导入 build_monitor_config_card
             from .card_builder import build_monitor_config_card
             card = build_monitor_config_card(config)
-            await card_service.send_card(chat_id, card)
+            await card_service.create_and_send_card(chat_id, card)
 
         except Exception as e:
             logger.error(f"查看监听配置失败: {e}", exc_info=True)

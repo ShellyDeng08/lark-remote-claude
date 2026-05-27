@@ -37,6 +37,7 @@ def write_row(screen, row, text, fg='default', bg='default'):
 # ── 1. ClaudeParser selected_value 测试 ─────────────────────────────────────
 
 from server.parsers.claude_parser import ClaudeParser
+from utils.components import OutputBlock
 
 
 class TestClaudeParserSelectedValue(unittest.TestCase):
@@ -178,6 +179,42 @@ class TestClaudeParserSelectedValue(unittest.TestCase):
         self.assertIsNotNone(ob)
         self.assertEqual(ob.selected_value, '2')
 
+    def test_unknown_leading_char_kept_as_output_block(self):
+        """未知首列字符（如 Update(...)）不应被丢弃"""
+        screen = make_screen()
+        write_row(screen, 20, 'Update(docs/knowledge/edm-fe-strategy/layer4-governance-observability-design.md)')
+        write_row(screen, 21, '  ⎿ Added 44 lines, removed 24 lines')
+        write_row(screen, 22, '─' * 80)
+        write_row(screen, 23, '❯ ')
+        write_row(screen, 24, '─' * 80)
+        write_row(screen, 25, 'bypass permissions on · esc to interrupt')
+        screen.cursor.y = 25
+
+        components = self.parser.parse(screen)
+        outputs = [c for c in components if isinstance(c, OutputBlock)]
+        self.assertGreaterEqual(len(outputs), 1)
+        merged = '\n'.join(o.content for o in outputs)
+        self.assertIn('Update(docs/knowledge/edm-fe-strategy/layer4-governance-observability-design.md)', merged)
+        self.assertIn('Added 44 lines, removed 24 lines', merged)
+
+    def test_indented_update_kept_as_output_block(self):
+        """首行带缩进的 Update(...) 也应保留"""
+        screen = make_screen()
+        write_row(screen, 20, '  Update(docs/knowledge/edm-fe-strategy/edm-fe-production-upgrade.md)')
+        write_row(screen, 21, '  ⎿ Added 1 line, removed 1 line')
+        write_row(screen, 22, '─' * 80)
+        write_row(screen, 23, '❯ ')
+        write_row(screen, 24, '─' * 80)
+        write_row(screen, 25, 'bypass permissions on · esc to interrupt')
+        screen.cursor.y = 25
+
+        components = self.parser.parse(screen)
+        outputs = [c for c in components if isinstance(c, OutputBlock)]
+        self.assertGreaterEqual(len(outputs), 1)
+        merged = '\n'.join(o.content for o in outputs)
+        self.assertIn('Update(docs/knowledge/edm-fe-strategy/edm-fe-production-upgrade.md)', merged)
+        self.assertIn('Added 1 line, removed 1 line', merged)
+
 
 # ── 2. CodexParser selected_value 测试 ──────────────────────────────────────
 
@@ -245,6 +282,42 @@ class TestCodexParserSelectedValue(unittest.TestCase):
         self.assertIsNotNone(ob)
         self.assertEqual(ob.sub_type, 'permission')
         self.assertEqual(ob.selected_value, '2')
+
+    def test_unknown_leading_char_kept_as_output_block_codex(self):
+        """Codex 未知首列字符（如 Update(...)）不应被丢弃"""
+        screen = make_screen()
+        write_row(screen, 20, 'Update(docs/knowledge/edm-fe-strategy/layer4-governance-observability-design.md)')
+        write_row(screen, 21, '  ⎿ Added 44 lines, removed 24 lines')
+        write_row(screen, 22, '─' * 80)
+        write_row(screen, 23, '› ')
+        write_row(screen, 24, '─' * 80)
+        write_row(screen, 25, 'gpt-5-codex high · 100% context left')
+        screen.cursor.y = 25
+
+        components = self.parser.parse(screen)
+        outputs = [c for c in components if isinstance(c, OutputBlock)]
+        self.assertGreaterEqual(len(outputs), 1)
+        merged = '\n'.join(o.content for o in outputs)
+        self.assertIn('Update(docs/knowledge/edm-fe-strategy/layer4-governance-observability-design.md)', merged)
+        self.assertIn('Added 44 lines, removed 24 lines', merged)
+
+    def test_indented_update_kept_as_output_block_codex(self):
+        """Codex 首行带缩进的 Update(...) 也应保留"""
+        screen = make_screen()
+        write_row(screen, 20, '  Update(docs/knowledge/edm-fe-strategy/edm-fe-production-upgrade.md)')
+        write_row(screen, 21, '  ⎿ Added 1 line, removed 1 line')
+        write_row(screen, 22, '─' * 80)
+        write_row(screen, 23, '› ')
+        write_row(screen, 24, '─' * 80)
+        write_row(screen, 25, 'gpt-5-codex high · 100% context left')
+        screen.cursor.y = 25
+
+        components = self.parser.parse(screen)
+        outputs = [c for c in components if isinstance(c, OutputBlock)]
+        self.assertGreaterEqual(len(outputs), 1)
+        merged = '\n'.join(o.content for o in outputs)
+        self.assertIn('Update(docs/knowledge/edm-fe-strategy/edm-fe-production-upgrade.md)', merged)
+        self.assertIn('Added 1 line, removed 1 line', merged)
 
 
 # ── 3. SharedMemoryPoller.read_snapshot() 测试 ──────────────────────────────
@@ -407,13 +480,18 @@ class TestHandleOptionSelect(unittest.IsolatedAsyncioTestCase):
         bridge = self._make_bridge()
         handler._bridges['chat1'] = bridge
 
-        # 第一次 selected_value 空，发 ↓；第二次到位
-        # 注意：新增了初始读取（记录 initial_block_id），比循环多消耗一次 snapshot
+        # 第一次 selected_value 持续为空（含重试）→ 发 ↓；第二次到位发 Enter
+        # 说明：handle_option_select 在 current 为空时会最多重试 5 次读取
         snapshots = [
             {'blocks': [], 'option_block': {'selected_value': '', 'block_id': 'Q:test', 'options': []}},  # 初始读取
             {'blocks': [], 'option_block': {'selected_value': '', 'block_id': 'Q:test', 'options': []}},  # step 0
-            {'blocks': [], 'option_block': {'selected_value': '', 'block_id': 'Q:test'}},  # 轮询等待，未变化
-            {'blocks': [], 'option_block': {'selected_value': '1', 'block_id': 'Q:test'}},  # 变化
+            {'blocks': [], 'option_block': {'selected_value': '', 'block_id': 'Q:test'}},  # retry 1
+            {'blocks': [], 'option_block': {'selected_value': '', 'block_id': 'Q:test'}},  # retry 2
+            {'blocks': [], 'option_block': {'selected_value': '', 'block_id': 'Q:test'}},  # retry 3
+            {'blocks': [], 'option_block': {'selected_value': '', 'block_id': 'Q:test'}},  # retry 4
+            {'blocks': [], 'option_block': {'selected_value': '', 'block_id': 'Q:test'}},  # retry 5
+            {'blocks': [], 'option_block': {'selected_value': '', 'block_id': 'Q:test'}},  # 等待共享内存变化：未变化
+            {'blocks': [], 'option_block': {'selected_value': '1', 'block_id': 'Q:test'}},  # 等待共享内存变化：变为目标
             self._make_snapshot('1', block_id='Q:test'),  # step 1：到位，发 Enter
         ]
         handler._poller.read_snapshot = MagicMock(side_effect=snapshots)

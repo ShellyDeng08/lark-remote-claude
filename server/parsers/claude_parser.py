@@ -553,8 +553,9 @@ class ClaudeParser(BaseParser):
         """去掉欢迎区域：跳过首列为空的前缀行和欢迎框（Claude Code box）"""
         i = 0
         while i < len(rows):
+            row_text = _get_row_text(screen, rows[i])
             col0 = _get_col0(screen, rows[i])
-            if not col0.strip():
+            if not row_text.strip():
                 i += 1
                 continue
             # 首个非空 col0 是 box 顶角 → 检查是否为欢迎框
@@ -634,7 +635,10 @@ class ClaudeParser(BaseParser):
                 in_box = True
                 continue
 
-            is_header = bool(col0.strip()) or (row in self._dot_row_cache)
+            # 兜底：当当前还没有 block 时，允许“首列为空但行内有文本”的行作为新 block 起点
+            # 典型场景：工具摘要前有缩进，例如 "  Update(...)"
+            line_text = _get_row_text(screen, row)
+            is_header = bool(col0.strip()) or (row in self._dot_row_cache) or (current_rows is None and bool(line_text.strip()))
 
             if is_header:
                 if current_rows is not None:
@@ -683,7 +687,25 @@ class ClaudeParser(BaseParser):
             )
 
         if not col0.strip():
-            return None
+            lines = [_get_row_text(screen, r) for r in block_rows]
+            first_line = lines[0].strip() if lines else ''
+            if not first_line:
+                return None
+            # 首行有缩进但无首列指示符（例如“  Update(...)”）时，按普通输出保留
+            full_lines = [lines[0].rstrip()] + [l.rstrip() for l in lines[1:]]
+            content = '\n'.join(full_lines).rstrip()
+            ansi_first = _get_row_ansi_text(screen, first_row).rstrip()
+            ansi_body = [_get_row_ansi_text(screen, r).rstrip() for r in block_rows[1:]]
+            ansi_content = '\n'.join([ansi_first] + ansi_body).rstrip()
+            content, ansi_content = _strip_inline_boxes_pair(content, ansi_content)
+            return OutputBlock(
+                content=content,
+                is_streaming=False,
+                start_row=first_row,
+                ansi_content=ansi_content,
+                indicator='',
+                ansi_indicator='',
+            )
 
         # PlanBlock：box-drawing 顶角字符（╭ 或 ┌）
         if col0 in BOX_CORNER_TOP:
@@ -760,7 +782,28 @@ class ClaudeParser(BaseParser):
         if col0 in BOX_CORNER_BOTTOM:
             return self._parse_system_block(screen, first_row, block_rows, lines, col0)
 
-        # 其他首列字符（装饰残留、欢迎区片段等），忽略
+        # 未知首列字符：按普通输出兜底，避免类似
+        # Update(...)
+        #   ⎿ Added 44 lines, removed 24 lines
+        # 这样的工具结果摘要被吞掉
+        first_line = lines[0].strip() if lines else ''
+        if first_line and not all(c in DIVIDER_CHARS for c in first_line):
+            full_lines = [lines[0].rstrip()] + [l.rstrip() for l in lines[1:]]
+            content = '\n'.join(full_lines).rstrip()
+            ansi_first = _get_row_ansi_text(screen, first_row).rstrip()
+            ansi_body = [_get_row_ansi_text(screen, r).rstrip() for r in block_rows[1:]]
+            ansi_content = '\n'.join([ansi_first] + ansi_body).rstrip()
+            content, ansi_content = _strip_inline_boxes_pair(content, ansi_content)
+            return OutputBlock(
+                content=content,
+                is_streaming=False,
+                start_row=first_row,
+                ansi_content=ansi_content,
+                indicator='',
+                ansi_indicator='',
+            )
+
+        # 装饰残留、欢迎区片段等仍忽略
         return None
 
     def _parse_plan_block(

@@ -439,6 +439,47 @@ class TestBuildStreamCard(unittest.TestCase):
         status_texts = [e["content"] for e in status_md if "Reading" in e.get("content", "")]
         self.assertEqual(len(status_texts), 1)
 
+    def test_group_stream_card_hides_detach_button(self):
+        blocks = [{"_type": "OutputBlock", "content": "text", "indicator": "●", "is_streaming": True}]
+        card = build_stream_card(blocks, session_name="s1", is_group=True)
+
+        actions = []
+        for e in card["body"]["elements"]:
+            if e.get("tag") != "form":
+                continue
+            for form_el in e.get("elements", []):
+                if form_el.get("tag") != "column_set":
+                    continue
+                for col in form_el.get("columns", []):
+                    for el in col.get("elements", []):
+                        for b in el.get("behaviors", []):
+                            act = b.get("value", {}).get("action")
+                            if act:
+                                actions.append(act)
+
+        self.assertIn("menu_open", actions)
+        self.assertNotIn("stream_detach", actions)
+
+    def test_p2p_stream_card_shows_detach_button(self):
+        blocks = [{"_type": "OutputBlock", "content": "text", "indicator": "●", "is_streaming": True}]
+        card = build_stream_card(blocks, session_name="s1", is_group=False)
+
+        actions = []
+        for e in card["body"]["elements"]:
+            if e.get("tag") != "form":
+                continue
+            for form_el in e.get("elements", []):
+                if form_el.get("tag") != "column_set":
+                    continue
+                for col in form_el.get("columns", []):
+                    for el in col.get("elements", []):
+                        for b in el.get("behaviors", []):
+                            act = b.get("value", {}).get("action")
+                            if act:
+                                actions.append(act)
+
+        self.assertIn("stream_detach", actions)
+
     def test_with_bottom_bar(self):
         blocks = [{"_type": "OutputBlock", "content": "text", "indicator": "●", "is_streaming": True}]
         bottom = {"text": "▶▶ bypass permissions on", "_type": "BottomBar"}
